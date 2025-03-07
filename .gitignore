@@ -1,0 +1,5 @@
+.env
+.vscode
+options_cache.db
+options_cache.db-journal
+
