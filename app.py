@@ -1,12 +1,37 @@
+# Replace the beginning of your file with this code:
 import streamlit as st
 import pandas as pd
 import numpy as np
-from ib_insync import *
 import time
 import threading
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 import locale
+
+# Set the event loop policy first
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
+# Create a new event loop and set it as the current loop
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Now that we have an event loop, apply nest_asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+# Define the helper function for other threads
+def setup_asyncio_event_loop():
+    """Ensure there is an event loop available for the current thread"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
+
+# Now import ib_insync after setting up the asyncio environment
+from ib_insync import *
+
 
 # Set locale for proper currency formatting
 locale.setlocale(locale.LC_ALL, '')
@@ -18,6 +43,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# Global variables
+stop_event = threading.Event()
+refresh_options = False
 
 # Initialize IB connection
 @st.cache_resource
@@ -31,7 +60,7 @@ ib = get_ib()
 def connect_to_ib():
     if not ib.isConnected():
         try:
-            ib.connect('127.0.0.1', 7497, clientId=1)  # Change port to 7496 for IB Gateway
+            ib.connect('127.0.0.1', 7496, clientId=1)  # Change port to 7496 for IB Gateway
             st.success("Connected to Interactive Brokers")
             return True
         except Exception as e:
@@ -39,33 +68,25 @@ def connect_to_ib():
             return False
     return True
 
-# Status indicator in sidebar
-st.sidebar.title("IB Connection Status")
-connection_status = st.sidebar.empty()
+# Function to safely run async code
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
-if not ib.isConnected():
-    if st.sidebar.button("Connect to TWS"):
-        connect_to_ib()
-
-# Update connection status
-if ib.isConnected():
-    connection_status.success("Connected to TWS")
-else:
-    connection_status.error("Not connected to TWS")
-
-# Function to get portfolio data
-def get_portfolio_data():
-    if not ib.isConnected():
-        return None, None, None
-    
+# Async wrapper for portfolio data
+async def async_get_portfolio_data(ib):
     # Get account summary
-    account_summary = ib.accountSummary()
+    account_summary = await ib.accountSummaryAsync()
     account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], 
-                              columns=['Tag', 'Value'])
+                          columns=['Tag', 'Value'])
     account_df = account_df.set_index('Tag')
     
     # Get positions
-    positions = ib.positions()
+    positions = await ib.positionsAsync()
     
     # Create a dictionary to store positions by underlying
     positions_by_underlying = {}
@@ -77,14 +98,16 @@ def get_portfolio_data():
         
         # Get market price for the underlying
         if contract.secType == 'STK':
-            underlying_price = ib.reqMktData(contract).marketPrice()
-            ib.sleep(0.1)  # Small delay to respect rate limits
+            underlying_contract = contract
         else:
             # For options, get the underlying price
             underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
-            ib.qualifyContracts(underlying_contract)
-            underlying_price = ib.reqMktData(underlying_contract).marketPrice()
-            ib.sleep(0.1)  # Small delay
+            await ib.qualifyContractsAsync(underlying_contract)
+        
+        # Use ticker to get real-time price updates
+        ticker = ib.reqMktData(underlying_contract)
+        await asyncio.sleep(0.2)  # Small delay to respect rate limits
+        underlying_price = ticker.marketPrice()
         
         if underlying_symbol not in positions_by_underlying:
             positions_by_underlying[underlying_symbol] = {
@@ -101,25 +124,32 @@ def get_portfolio_data():
             positions_by_underlying[underlying_symbol]['stock_value'] += pos.position * underlying_price
         elif contract.secType == 'OPT':
             # Get option data
-            option_data = ib.reqMktData(contract)
-            ib.sleep(0.1)  # Small delay
+            option_ticker = ib.reqMktData(contract)
+            await asyncio.sleep(0.2)  # Small delay to respect rate limits
             
-            # Calculate option delta (if available, otherwise use 0.5 as placeholder)
-            if hasattr(option_data, 'modelGreeks') and option_data.modelGreeks:
-                delta = option_data.modelGreeks.delta
+            # Calculate option delta (if available, otherwise use approximation)
+            delta = None
+            option_price = option_ticker.marketPrice()
+            
+            if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
+                delta = option_ticker.modelGreeks.delta
             else:
                 # Request option computation
-                ib.reqMarketDataType(4)  # Switch to delayed frozen data
-                ib.calculateImpliedVolatility(contract, option_data.marketPrice(), underlying_price)
-                ib.sleep(0.2)
-                ib.calculateOptionPrice(contract, option_data.impliedVolatility, underlying_price)
-                ib.sleep(0.2)
+                await ib.reqMarketDataTypeAsync(4)  # Switch to delayed frozen data
+                try:
+                    await ib.calculateImpliedVolatilityAsync(contract, option_price, underlying_price)
+                    await asyncio.sleep(0.2)
+                    await ib.calculateOptionPriceAsync(contract, option_ticker.impliedVolatility, underlying_price)
+                    await asyncio.sleep(0.2)
+                    
+                    # Try again to get delta
+                    if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
+                        delta = option_ticker.modelGreeks.delta
+                except:
+                    pass
                 
-                # Try again to get delta
-                if hasattr(option_data, 'modelGreeks') and option_data.modelGreeks:
-                    delta = option_data.modelGreeks.delta
-                else:
-                    # Fallback delta calculation based on in-the-money status
+                # Fallback delta calculation if still None
+                if delta is None:
                     if contract.right == 'C':  # Call option
                         delta = 0.7 if underlying_price > contract.strike else 0.3
                     else:  # Put option
@@ -132,7 +162,6 @@ def get_portfolio_data():
             positions_by_underlying[underlying_symbol]['option_notional'] += option_notional
             
             # Calculate actual option value
-            option_price = option_data.marketPrice()
             option_value = option_price * option_multiplier * abs(pos.position)
             positions_by_underlying[underlying_symbol]['option_actual_value'] += option_value
     
@@ -179,22 +208,19 @@ def get_portfolio_data():
     
     return account_df, underlying_df, positions_by_underlying
 
-# Function to get option chain data
-def get_option_chain(ticker):
-    if not ib.isConnected():
-        return None, None
-    
+# Async wrapper for option chain data
+async def async_get_option_chain(ib, ticker):
     # Get the stock contract
     stock = Stock(ticker, 'SMART', 'USD')
-    ib.qualifyContracts(stock)
+    await ib.qualifyContractsAsync(stock)
     
     # Get current stock price
-    stock_data = ib.reqMktData(stock)
-    ib.sleep(0.2)
-    stock_price = stock_data.marketPrice()
+    ticker = ib.reqMktData(stock)
+    await asyncio.sleep(0.2)
+    stock_price = ticker.marketPrice()
     
     # Get the option chains
-    chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+    chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
     
     # Get all expiration dates
     expirations = []
@@ -206,23 +232,19 @@ def get_option_chain(ticker):
     # Return all data needed
     return stock_price, expirations
 
-# Function to get options data for specific expiration
-def get_options_for_expiration(ticker, expiration):
-    if not ib.isConnected():
-        return None, None, None
-    
+# Async wrapper for options data
+async def async_get_options_for_expiration(ib, ticker, expiration):
     # Get the stock contract
     stock = Stock(ticker, 'SMART', 'USD')
-    ib.qualifyContracts(stock)
+    await ib.qualifyContractsAsync(stock)
     
     # Get current stock price
-    stock_data = ib.reqMktData(stock)
-    ib.sleep(0.2)
-    stock_price = stock_data.marketPrice()
+    ticker_data = ib.reqMktData(stock)
+    await asyncio.sleep(0.2)
+    stock_price = ticker_data.marketPrice()
     
     # Get option chain for selected expiration
-    ib.qualifyContracts(stock)
-    chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+    chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
     
     # Find the SMART exchange chain
     chain = next((c for c in chains if c.exchange == 'SMART'), None)
@@ -241,71 +263,50 @@ def get_options_for_expiration(ticker, expiration):
         call_contract = Option(ticker, expiration, strike, 'C', 'SMART')
         put_contract = Option(ticker, expiration, strike, 'P', 'SMART')
         
-        ib.qualifyContracts(call_contract, put_contract)
+        await ib.qualifyContractsAsync(call_contract, put_contract)
         
         # Request market data for call
-        call_data = ib.reqMktData(call_contract)
-        ib.sleep(0.1)  # Small delay to respect rate limits
+        call_ticker = ib.reqMktData(call_contract)
+        await asyncio.sleep(0.1)  # Small delay to respect rate limits
         
         # Request market data for put
-        put_data = ib.reqMktData(put_contract)
-        ib.sleep(0.1)  # Small delay
+        put_ticker = ib.reqMktData(put_contract)
+        await asyncio.sleep(0.1)  # Small delay
         
-        # Get greeks for call
-        call_price = call_data.marketPrice()
-        call_bid = call_data.bid
-        call_ask = call_data.ask
-        call_last = call_data.last
+        # Get data for call
+        call_price = call_ticker.marketPrice()
+        call_bid = call_ticker.bid
+        call_ask = call_ticker.ask
+        call_last = call_ticker.last
         
-        # Try to get delta and gamma
+        # Try to get delta and gamma for call
         call_delta = None
         call_gamma = None
         
-        if hasattr(call_data, 'modelGreeks') and call_data.modelGreeks:
-            call_delta = call_data.modelGreeks.delta
-            call_gamma = call_data.modelGreeks.gamma
+        if hasattr(call_ticker, 'modelGreeks') and call_ticker.modelGreeks:
+            call_delta = call_ticker.modelGreeks.delta
+            call_gamma = call_ticker.modelGreeks.gamma
         else:
-            # Calculate implied volatility and greeks
-            try:
-                ib.calculateImpliedVolatility(call_contract, call_price, stock_price)
-                ib.sleep(0.2)
-                ib.calculateOptionPrice(call_contract, call_data.impliedVolatility, stock_price)
-                ib.sleep(0.2)
-                
-                if hasattr(call_data, 'modelGreeks') and call_data.modelGreeks:
-                    call_delta = call_data.modelGreeks.delta
-                    call_gamma = call_data.modelGreeks.gamma
-            except:
-                # Fallback delta calculation
-                call_delta = 0.7 if stock_price > strike else 0.3
-                call_gamma = 0.01  # Default gamma
+            # Use approximation
+            call_delta = 0.7 if stock_price > strike else 0.3
+            call_gamma = 0.01  # Default gamma
         
         # Similarly for put
-        put_price = put_data.marketPrice()
-        put_bid = put_data.bid
-        put_ask = put_data.ask
-        put_last = put_data.last
+        put_price = put_ticker.marketPrice()
+        put_bid = put_ticker.bid
+        put_ask = put_ticker.ask
+        put_last = put_ticker.last
         
         put_delta = None
         put_gamma = None
         
-        if hasattr(put_data, 'modelGreeks') and put_data.modelGreeks:
-            put_delta = put_data.modelGreeks.delta
-            put_gamma = put_data.modelGreeks.gamma
+        if hasattr(put_ticker, 'modelGreeks') and put_ticker.modelGreeks:
+            put_delta = put_ticker.modelGreeks.delta
+            put_gamma = put_ticker.modelGreeks.gamma
         else:
-            try:
-                ib.calculateImpliedVolatility(put_contract, put_price, stock_price)
-                ib.sleep(0.2)
-                ib.calculateOptionPrice(put_contract, put_data.impliedVolatility, stock_price)
-                ib.sleep(0.2)
-                
-                if hasattr(put_data, 'modelGreeks') and put_data.modelGreeks:
-                    put_delta = put_data.modelGreeks.delta
-                    put_gamma = put_data.modelGreeks.gamma
-            except:
-                # Fallback delta calculation
-                put_delta = -0.7 if stock_price < strike else -0.3
-                put_gamma = 0.01  # Default gamma
+            # Use approximation
+            put_delta = -0.7 if stock_price < strike else -0.3
+            put_gamma = 0.01  # Default gamma
         
         # Calculate percentage of stock price
         call_pct = (call_price / stock_price) * 100 if stock_price > 0 else 0
@@ -341,8 +342,50 @@ def get_options_for_expiration(ticker, expiration):
     
     return stock_price, calls, puts
 
+# Non-async wrapper functions for threading
+def get_portfolio_data():
+    if not ib.isConnected():
+        return None, None, None
+    try:
+        return run_async(async_get_portfolio_data(ib))
+    except Exception as e:
+        st.error(f"Error getting portfolio data: {e}")
+        return None, None, None
+
+def get_option_chain(ticker):
+    if not ib.isConnected():
+        return None, None
+    try:
+        return run_async(async_get_option_chain(ib, ticker))
+    except Exception as e:
+        st.error(f"Error getting option chain: {e}")
+        return None, None
+
+def get_options_for_expiration(ticker, expiration):
+    if not ib.isConnected():
+        return None, None, None
+    try:
+        return run_async(async_get_options_for_expiration(ib, ticker, expiration))
+    except Exception as e:
+        st.error(f"Error getting options data: {e}")
+        return None, None, None
+
 # UI Layout - Main App
 st.title("Interactive Brokers Portfolio Viewer")
+
+# Status indicator in sidebar
+st.sidebar.title("IB Connection Status")
+connection_status = st.sidebar.empty()
+
+if not ib.isConnected():
+    if st.sidebar.button("Connect to TWS"):
+        connect_to_ib()
+
+# Update connection status
+if ib.isConnected():
+    connection_status.success("Connected to TWS")
+else:
+    connection_status.error("Not connected to TWS")
 
 # Portfolio-wide metrics section (always visible)
 st.header("Portfolio Metrics")
@@ -365,11 +408,13 @@ options_display = st.empty()
 refresh_rate = st.sidebar.slider("Portfolio Refresh Rate (seconds)", 5, 30, 15)
 options_refresh_rate = st.sidebar.slider("Options Refresh Rate (seconds)", 1, 10, 5)
 
-# Create stop event for background threads
-stop_event = threading.Event()
+
 
 # Function to update portfolio data in background
 def update_portfolio_data():
+    # Set up event loop for this thread
+    setup_asyncio_event_loop()
+    
     while not stop_event.is_set():
         if ib.isConnected():
             account_df, underlying_df, _ = get_portfolio_data()
@@ -426,6 +471,9 @@ def update_portfolio_data():
 
 # Function to update options data in background
 def update_options_data():
+    # Set up event loop for this thread
+    setup_asyncio_event_loop()
+    
     current_ticker = ""
     current_expiration = ""
     
@@ -493,6 +541,9 @@ def update_options_data():
 
 # Start background threads
 def main():
+    # Set up event loop for the main thread
+    setup_asyncio_event_loop()
+    
     if connect_to_ib():
         # Create and start portfolio update thread
         portfolio_thread = threading.Thread(target=update_portfolio_data)
@@ -519,6 +570,9 @@ def main():
 
 # Handle Streamlit's odd execution model
 if __name__ == "__main__":
+    # Ensure event loop is set up
+    setup_asyncio_event_loop()
+    
     # Set up session state for options refresh
     if 'refresh_options' not in st.session_state:
         st.session_state.refresh_options = False
