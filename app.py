@@ -60,8 +60,41 @@ ib = get_ib()
 def connect_to_ib():
     if not ib.isConnected():
         try:
-            ib.connect('127.0.0.1', 7496, clientId=1)  # Change port to 7496 for IB Gateway
+            ib.connect('127.0.0.1', 7496, clientId=1)
             st.success("Connected to Interactive Brokers")
+            
+            # Add diagnostic information
+            st.info("Checking account data availability...")
+            
+            # Test if we can get account info
+            try:
+                account_values = run_async(ib.accountSummaryAsync())
+                if account_values:
+                    st.success(f"Successfully retrieved {len(account_values)} account values")
+                    # Display a sample of key values for diagnostics
+                    account_sample = [val for val in account_values if val.tag in ['NetLiquidation', 'GrossPositionValue', 'TotalCashValue']]
+                    if account_sample:
+                        for val in account_sample:
+                            st.write(f"{val.tag}: {val.value}")
+                else:
+                    st.warning("Account data returned empty. Check permissions in IB Gateway.")
+            except Exception as e:
+                st.error(f"Error retrieving account data: {e}")
+                
+            # Test if we can get positions
+            try:
+                positions = run_async(ib.positionsAsync())
+                if positions:
+                    st.success(f"Successfully retrieved {len(positions)} positions")
+                    # Show a sample position for diagnostics
+                    if len(positions) > 0:
+                        pos = positions[0]
+                        st.write(f"Example position: {pos.contract.symbol}, {pos.position} @ {pos.avgCost}")
+                else:
+                    st.warning("No positions found. If you expect positions, check IB Gateway permissions.")
+            except Exception as e:
+                st.error(f"Error retrieving positions: {e}")
+                
             return True
         except Exception as e:
             st.error(f"Failed to connect to Interactive Brokers: {e}")
@@ -79,134 +112,174 @@ def run_async(coro):
 
 # Async wrapper for portfolio data
 async def async_get_portfolio_data(ib):
-    # Get account summary
-    account_summary = await ib.accountSummaryAsync()
-    account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], 
-                          columns=['Tag', 'Value'])
-    account_df = account_df.set_index('Tag')
-    
-    # Get positions
-    positions = await ib.positionsAsync()
-    
-    # Create a dictionary to store positions by underlying
-    positions_by_underlying = {}
-    
-    # Process positions
-    for pos in positions:
-        contract = pos.contract
-        underlying_symbol = contract.symbol
-        
-        # Get market price for the underlying
-        if contract.secType == 'STK':
-            underlying_contract = contract
-        else:
-            # For options, get the underlying price
-            underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
-            await ib.qualifyContractsAsync(underlying_contract)
-        
-        # Use ticker to get real-time price updates
-        ticker = ib.reqMktData(underlying_contract)
-        await asyncio.sleep(0.2)  # Small delay to respect rate limits
-        underlying_price = ticker.marketPrice()
-        
-        if underlying_symbol not in positions_by_underlying:
-            positions_by_underlying[underlying_symbol] = {
-                'stock_count': 0,
-                'stock_value': 0,
-                'option_notional': 0,
-                'option_actual_value': 0,
-                'underlying_price': underlying_price
-            }
-        
-        # Calculate position values
-        if contract.secType == 'STK':
-            positions_by_underlying[underlying_symbol]['stock_count'] += pos.position
-            positions_by_underlying[underlying_symbol]['stock_value'] += pos.position * underlying_price
-        elif contract.secType == 'OPT':
-            # Get option data
-            option_ticker = ib.reqMktData(contract)
-            await asyncio.sleep(0.2)  # Small delay to respect rate limits
-            
-            # Calculate option delta (if available, otherwise use approximation)
-            delta = None
-            option_price = option_ticker.marketPrice()
-            
-            if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
-                delta = option_ticker.modelGreeks.delta
-            else:
-                # Request option computation
-                await ib.reqMarketDataTypeAsync(4)  # Switch to delayed frozen data
-                try:
-                    await ib.calculateImpliedVolatilityAsync(contract, option_price, underlying_price)
-                    await asyncio.sleep(0.2)
-                    await ib.calculateOptionPriceAsync(contract, option_ticker.impliedVolatility, underlying_price)
-                    await asyncio.sleep(0.2)
-                    
-                    # Try again to get delta
-                    if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
-                        delta = option_ticker.modelGreeks.delta
-                except:
-                    pass
-                
-                # Fallback delta calculation if still None
-                if delta is None:
-                    if contract.right == 'C':  # Call option
-                        delta = 0.7 if underlying_price > contract.strike else 0.3
-                    else:  # Put option
-                        delta = -0.7 if underlying_price < contract.strike else -0.3
-            
-            # Use absolute value of delta for notional calculation
-            abs_delta = abs(delta)
-            option_multiplier = 100
-            option_notional = abs_delta * option_multiplier * pos.position
-            positions_by_underlying[underlying_symbol]['option_notional'] += option_notional
-            
-            # Calculate actual option value
-            option_value = option_price * option_multiplier * abs(pos.position)
-            positions_by_underlying[underlying_symbol]['option_actual_value'] += option_value
-    
-    # Create DataFrame for display
-    underlying_data = []
-    total_npv = 0
-    
-    for symbol, data in positions_by_underlying.items():
-        stock_notional = data['stock_count'] * data['underlying_price']
-        option_notional = data['option_notional'] * data['underlying_price']
-        total_notional = stock_notional + option_notional
-        
-        underlying_data.append({
-            'Symbol': symbol,
-            'Stock Count': data['stock_count'],
-            'Stock Value': data['stock_value'],
-            'Option Notional (Shares)': data['option_notional'] / 100,  # Convert to contract equivalents
-            'Option Notional Value': option_notional,
-            'Option Actual Value': data['option_actual_value'],
-            'Underlying Price': data['underlying_price'],
-            'Notional Position Value (NPV)': total_notional
-        })
-        
-        total_npv += total_notional
-    
-    underlying_df = pd.DataFrame(underlying_data)
-    
-    # Calculate portfolio metrics
     try:
-        nlv = float(account_df.loc['NetLiquidation', 'Value'])
-        gross_pos_val = float(account_df.loc['GrossPositionValue', 'Value'])
+        # Debug info
+        st.sidebar.text("Fetching account data...")
         
-        # Calculate notional leverage ratio
-        notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
-        standard_leverage_ratio = gross_pos_val / nlv if nlv > 0 else 0
+        # Get account summary
+        account_summary = await ib.accountSummaryAsync()
         
-        # Add NGAV and NLR to account summary
-        account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = locale.currency(total_npv, grouping=True)
-        account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
-        account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
-    except:
-        # Handle case where account data doesn't have the expected fields
-        pass
-    
-    return account_df, underlying_df, positions_by_underlying
+        if not account_summary:
+            st.sidebar.warning("Account summary is empty")
+            return None, None, None
+            
+        st.sidebar.text(f"Got {len(account_summary)} account values")
+        
+        account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], 
+                            columns=['Tag', 'Value'])
+        account_df = account_df.set_index('Tag')
+        
+        # Get positions
+        st.sidebar.text("Fetching positions...")
+        positions = await ib.positionsAsync()
+        
+        if not positions:
+            st.sidebar.warning("No positions found")
+            # Return account data even if no positions
+            return account_df, pd.DataFrame(), {}
+            
+        st.sidebar.text(f"Got {len(positions)} positions")
+        
+        # Create a dictionary to store positions by underlying
+        positions_by_underlying = {}
+        
+        # Process positions
+        st.sidebar.text("Processing positions...")
+        position_count = 0
+        
+        for pos in positions:
+            position_count += 1
+            contract = pos.contract
+            underlying_symbol = contract.symbol
+            
+            # Get market price for the underlying
+            if contract.secType == 'STK':
+                underlying_contract = contract
+            else:
+                # For options, get the underlying price
+                underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
+                await ib.qualifyContractsAsync(underlying_contract)
+            
+            # Use ticker to get real-time price updates
+            ticker = ib.reqMktData(underlying_contract)
+            await asyncio.sleep(0.2)  # Small delay to respect rate limits
+            underlying_price = ticker.marketPrice()
+            
+            if position_count <= 2:  # Show debug for first couple positions only
+                st.sidebar.text(f"Position {position_count}: {underlying_symbol} @ {underlying_price}")
+            
+            if underlying_symbol not in positions_by_underlying:
+                positions_by_underlying[underlying_symbol] = {
+                    'stock_count': 0,
+                    'stock_value': 0,
+                    'option_notional': 0,
+                    'option_actual_value': 0,
+                    'underlying_price': underlying_price
+                }
+            
+            # Calculate position values
+            if contract.secType == 'STK':
+                positions_by_underlying[underlying_symbol]['stock_count'] += pos.position
+                positions_by_underlying[underlying_symbol]['stock_value'] += pos.position * underlying_price
+            elif contract.secType == 'OPT':
+                # Get option data
+                option_ticker = ib.reqMktData(contract)
+                await asyncio.sleep(0.2)  # Small delay to respect rate limits
+                
+                # Calculate option delta (if available, otherwise use approximation)
+                delta = None
+                option_price = option_ticker.marketPrice()
+                
+                if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
+                    delta = option_ticker.modelGreeks.delta
+                else:
+                    # Request option computation
+                    await ib.reqMarketDataTypeAsync(4)  # Switch to delayed frozen data
+                    try:
+                        await ib.calculateImpliedVolatilityAsync(contract, option_price, underlying_price)
+                        await asyncio.sleep(0.2)
+                        await ib.calculateOptionPriceAsync(contract, option_ticker.impliedVolatility, underlying_price)
+                        await asyncio.sleep(0.2)
+                        
+                        # Try again to get delta
+                        if hasattr(option_ticker, 'modelGreeks') and option_ticker.modelGreeks:
+                            delta = option_ticker.modelGreeks.delta
+                    except Exception as option_error:
+                        st.sidebar.text(f"Option calculation error: {option_error}")
+                    
+                    # Fallback delta calculation if still None
+                    if delta is None:
+                        if contract.right == 'C':  # Call option
+                            delta = 0.7 if underlying_price > contract.strike else 0.3
+                        else:  # Put option
+                            delta = -0.7 if underlying_price < contract.strike else -0.3
+                
+                # Use absolute value of delta for notional calculation
+                abs_delta = abs(delta)
+                option_multiplier = 100
+                option_notional = abs_delta * option_multiplier * pos.position
+                positions_by_underlying[underlying_symbol]['option_notional'] += option_notional
+                
+                # Calculate actual option value
+                option_value = option_price * option_multiplier * abs(pos.position)
+                positions_by_underlying[underlying_symbol]['option_actual_value'] += option_value
+        
+        st.sidebar.text("Creating dataframe...")
+        
+        # Create DataFrame for display
+        underlying_data = []
+        total_npv = 0
+        
+        for symbol, data in positions_by_underlying.items():
+            stock_notional = data['stock_count'] * data['underlying_price']
+            option_notional = data['option_notional'] * data['underlying_price']
+            total_notional = stock_notional + option_notional
+            
+            underlying_data.append({
+                'Symbol': symbol,
+                'Stock Count': data['stock_count'],
+                'Stock Value': data['stock_value'],
+                'Option Notional (Shares)': data['option_notional'] / 100,  # Convert to contract equivalents
+                'Option Notional Value': option_notional,
+                'Option Actual Value': data['option_actual_value'],
+                'Underlying Price': data['underlying_price'],
+                'Notional Position Value (NPV)': total_notional
+            })
+            
+            total_npv += total_notional
+        
+        underlying_df = pd.DataFrame(underlying_data)
+        st.sidebar.text(f"Created dataframe with {len(underlying_df)} rows")
+        
+        # Calculate portfolio metrics
+        st.sidebar.text("Calculating metrics...")
+        try:
+            nlv = float(account_df.loc['NetLiquidation', 'Value'])
+            gross_pos_val = float(account_df.loc['GrossPositionValue', 'Value'])
+            
+            # Calculate notional leverage ratio
+            notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
+            standard_leverage_ratio = gross_pos_val / nlv if nlv > 0 else 0
+            
+            # Add NGAV and NLR to account summary
+            account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = locale.currency(total_npv, grouping=True)
+            account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
+            account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
+            
+            st.sidebar.text("Metrics calculated successfully")
+        except Exception as metrics_error:
+            st.sidebar.error(f"Error calculating metrics: {metrics_error}")
+            # Handle case where account data doesn't have the expected fields
+            pass
+        
+        st.sidebar.text("Portfolio data retrieval complete")
+        return account_df, underlying_df, positions_by_underlying
+        
+    except Exception as e:
+        st.sidebar.error(f"Error in portfolio data retrieval: {str(e)}")
+        import traceback
+        st.sidebar.text(traceback.format_exc())
+        return None, None, None
 
 # Async wrapper for option chain data
 async def async_get_option_chain(ib, ticker):
@@ -407,7 +480,55 @@ options_display = st.empty()
 # Data refresh control
 refresh_rate = st.sidebar.slider("Portfolio Refresh Rate (seconds)", 5, 30, 15)
 options_refresh_rate = st.sidebar.slider("Options Refresh Rate (seconds)", 1, 10, 5)
-
+# Diagnostics section
+st.sidebar.markdown("---")
+st.sidebar.title("Diagnostics")
+if st.sidebar.button("Test API Data Access"):
+    with st.sidebar.expander("API Test Results", expanded=True):
+        st.write("Testing IB API connection...")
+        
+        if not ib.isConnected():
+            st.error("Not connected to IB Gateway")
+        else:
+            st.success("Connected to IB Gateway")
+            
+            # Test account data
+            try:
+                st.write("Requesting account data...")
+                account_values = run_async(ib.accountSummaryAsync())
+                st.write(f"Received {len(account_values)} account values")
+                
+                # Display sample
+                if account_values:
+                    df = pd.DataFrame([(val.tag, val.value) for val in account_values[:10]], 
+                                      columns=['Tag', 'Value'])
+                    st.dataframe(df)
+                else:
+                    st.warning("No account data received")
+            except Exception as e:
+                st.error(f"Error getting account data: {e}")
+                
+            # Test positions
+            try:
+                st.write("Requesting positions...")
+                positions = run_async(ib.positionsAsync())
+                st.write(f"Received {len(positions)} positions")
+                
+                # Display sample
+                if positions:
+                    pos_data = []
+                    for pos in positions[:5]:  # Show first 5 positions
+                        pos_data.append({
+                            'Symbol': pos.contract.symbol,
+                            'SecType': pos.contract.secType,
+                            'Position': pos.position,
+                            'Avg Cost': pos.avgCost
+                        })
+                    st.dataframe(pd.DataFrame(pos_data))
+                else:
+                    st.warning("No positions received")
+            except Exception as e:
+                st.error(f"Error getting positions: {e}")
 
 
 # Function to update portfolio data in background
