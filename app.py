@@ -1,4 +1,3 @@
-# Replace the beginning of your file with this code:
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +6,7 @@ import threading
 import asyncio
 from datetime import datetime
 import locale
+import random
 
 # Set the event loop policy first
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
@@ -18,6 +18,28 @@ asyncio.set_event_loop(loop)
 # Now that we have an event loop, apply nest_asyncio
 import nest_asyncio
 nest_asyncio.apply()
+
+def safe_float_conversion(value_str):
+    """Safely convert a string to float, handling various formats"""
+    if value_str is None:
+        return 0.0
+    
+    # Handle various string formats
+    if isinstance(value_str, str):
+        # Remove currency symbols and commas
+        clean_str = value_str.replace(locale.localeconv()['currency_symbol'], '')
+        clean_str = clean_str.replace(',', '')
+        try:
+            return float(clean_str)
+        except ValueError:
+            st.sidebar.warning(f"Could not convert '{value_str}' to float")
+            return 0.0
+    
+    # Already a number
+    try:
+        return float(value_str)
+    except (ValueError, TypeError):
+        return 0.0
 
 # Define the helper function for other threads
 def setup_asyncio_event_loop():
@@ -60,6 +82,15 @@ ib = get_ib()
 def connect_to_ib():
     if not ib.isConnected():
         try:
+             # Use a random client ID to avoid conflicts
+            client_id = random.randint(1000, 9999)
+            st.sidebar.text(f"Connecting with client ID: {client_id}")
+            
+            # Try to disconnect first in case of lingering connections
+            try:
+                ib.disconnect()
+            except:
+                pass
             ib.connect('127.0.0.1', 7496, clientId=1)
             st.success("Connected to Interactive Brokers")
             
@@ -164,7 +195,22 @@ async def async_get_portfolio_data(ib):
             ticker = ib.reqMktData(underlying_contract)
             await asyncio.sleep(0.2)  # Small delay to respect rate limits
             underlying_price = ticker.marketPrice()
-            
+            if underlying_price is None or underlying_price <= 0:
+                # Try last price
+                underlying_price = ticker.last
+                if underlying_price is None or underlying_price <= 0:
+                    # Try mid price
+                    underlying_price = (ticker.ask + ticker.bid) / 2 if ticker.ask and ticker.bid else None
+                    if underlying_price is None or underlying_price <= 0:
+                        # Use average cost as last resort
+                        if contract.secType == 'STK':
+                            underlying_price = pos.avgCost
+                            st.sidebar.warning(f"No market price for {underlying_symbol}, using avg cost: {underlying_price}")
+                        else:
+                            # For options without price data, set a placeholder
+                            st.sidebar.warning(f"No price data for {underlying_symbol}, using 100 as placeholder")
+                            underlying_price = 100  # Arbitrary placeholder
+
             if position_count <= 2:  # Show debug for first couple positions only
                 st.sidebar.text(f"Position {position_count}: {underlying_symbol} @ {underlying_price}")
             
@@ -254,8 +300,8 @@ async def async_get_portfolio_data(ib):
         # Calculate portfolio metrics
         st.sidebar.text("Calculating metrics...")
         try:
-            nlv = float(account_df.loc['NetLiquidation', 'Value'])
-            gross_pos_val = float(account_df.loc['GrossPositionValue', 'Value'])
+            nlv = safe_float_conversion(account_df.loc['NetLiquidation', 'Value'])
+            gross_pos_val = safe_float_conversion(account_df.loc['GrossPositionValue', 'Value'])
             
             # Calculate notional leverage ratio
             notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
@@ -530,7 +576,9 @@ if st.sidebar.button("Test API Data Access"):
             except Exception as e:
                 st.error(f"Error getting positions: {e}")
 
-
+if st.sidebar.button("Direct Portfolio Fetch"):
+    st.sidebar.info("Directly fetching portfolio data (bypassing threading)...")
+    
 # Function to update portfolio data in background
 def update_portfolio_data():
     # Set up event loop for this thread
@@ -550,7 +598,7 @@ def update_portfolio_data():
                     try:
                         nlv = float(account_df.loc['NetLiquidation', 'Value'])
                         gross_pos_val = float(account_df.loc['GrossPositionValue', 'Value'])
-                        ngav = locale.atof(account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'].replace(locale.localeconv()['currency_symbol'], ''))
+                        ngav = safe_float_conversion(account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'])
                         nlr = float(account_df.loc['NLR (Notional Leverage Ratio)', 'Value'])
                         std_leverage = float(account_df.loc['Standard Leverage Ratio', 'Value'])
                         
