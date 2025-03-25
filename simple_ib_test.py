@@ -128,40 +128,95 @@ if st.button("Connect to IB Gateway"):
             st.dataframe(positions_df)
         
         # Test market data
+        # Test market data
         st.subheader("Market Data Test")
         try:
             st.info("Requesting AAPL market data...")
+            
+            # Use delayed data type (3) instead of real-time (1)
+            ib.reqMarketDataType(1)
+            
+            # Create contract and qualify it
             stock = Stock('AAPL', 'SMART', 'USD')
             ib.qualifyContracts(stock)
             
-            ticker = ib.reqMktData(stock, '', False, False)
+            # Request market data with simplified parameters
+            ticker = ib.reqMktData(stock)
             
-            # Wait a bit for data
+            # Wait longer and show more details
             progress_bar = st.progress(0)
-            for i in range(10):
-                progress_bar.progress((i+1)/10)
+            st.text("Waiting for market data to arrive...")
+            
+            # Initialize data display
+            data_display = st.empty()
+            
+            # Wait with more feedback
+            for i in range(20):  # Wait longer (10 seconds)
+                progress_bar.progress((i+1)/20)
+                
+                # Show the current state of the ticker
+                ticker_data = {
+                    'Market Price': ticker.marketPrice(),
+                    'Last': ticker.last,
+                    'Bid': ticker.bid,
+                    'Ask': ticker.ask,
+                    'Close': ticker.close,
+                    'Time': ticker.time,
+                    'Has Market Data': hasattr(ticker, 'marketPrice') and ticker.marketPrice() is not None
+                }
+                data_display.json(ticker_data)
+                
+                # If we get a price, we can break early
+                if ticker.marketPrice() is not None and ticker.marketPrice() > 0:
+                    break
+                    
                 time.sleep(0.5)
             
-            # Display ticker data
-            ticker_data = {
-                'Price': ticker.marketPrice(),
+            # Final data display
+            st.write("AAPL Market Data:")
+            
+            # More complete ticker data
+            final_ticker_data = {
+                'Market Price': ticker.marketPrice(),
                 'Last': ticker.last,
                 'Bid': ticker.bid,
                 'Ask': ticker.ask,
                 'Close': ticker.close,
-                'Volume': ticker.volume
+                'Open': ticker.open,
+                'High': ticker.high,
+                'Low': ticker.low,
+                'Volume': ticker.volume,
+                'Time': ticker.time
             }
             
-            st.write("AAPL Market Data:")
-            st.write(ticker_data)
+            st.write(final_ticker_data)
             
-            if ticker.marketPrice() is not None and ticker.marketPrice() > 0:
-                st.success(f"Successfully received market price: ${ticker.marketPrice()}")
+            # Check different price attributes in case marketPrice() is not working
+            price = ticker.marketPrice()
+            if price is None or price <= 0:
+                price = ticker.last
+                if price is None or price <= 0:
+                    price = (ticker.bid + ticker.ask) / 2 if ticker.bid and ticker.ask else None
+            
+            if price is not None and price > 0:
+                st.success(f"Successfully received market price: ${price:.2f}")
             else:
                 st.warning("Did not receive a valid market price. Check market data permissions.")
+                
+            # Show some debugging info about the ticker
+            with st.expander("Ticker Debug Info"):
+                st.text(f"Ticker has marketPrice attribute: {hasattr(ticker, 'marketPrice')}")
+                st.text(f"Ticker modelGreeks: {ticker.modelGreeks}")
+                st.text(f"All ticker attributes: {dir(ticker)}")
+                
+            # Clean up when done by canceling the market data
+            ib.cancelMktData(stock)
+            
         except Exception as e:
             st.error(f"Error testing market data: {e}")
-        
+            import traceback
+            st.text(traceback.format_exc())
+                
         # Option to disconnect
         if st.button("Disconnect"):
             ib.disconnect()
