@@ -91,7 +91,7 @@ def connect_to_ib():
                 ib.disconnect()
             except:
                 pass
-            ib.connect('127.0.0.1', 7496, clientId=1)
+            ib.connect('127.0.0.1', 7497, clientId=1)
             st.success("Connected to Interactive Brokers")
             
             # Add diagnostic information

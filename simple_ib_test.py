@@ -113,7 +113,7 @@ if st.button("Connect to IB Gateway"):
         st.write(f"Connection Time: {server_time}")
         
         # Request market data type
-        ib.reqMarketDataType(3)  # Use delayed data
+        ib.reqMarketDataType(1)  # Use real-time data
         
         # Get account info
         st.subheader("Account Summary")
@@ -134,7 +134,7 @@ if st.button("Connect to IB Gateway"):
             stock = Stock('AAPL', 'SMART', 'USD')
             ib.qualifyContracts(stock)
             
-            ticker = ib.reqMktData(stock)
+            ticker = ib.reqMktData(stock, '', False, False)
             
             # Wait a bit for data
             progress_bar = st.progress(0)
