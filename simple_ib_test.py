@@ -128,90 +128,152 @@ if st.button("Connect to IB Gateway"):
             st.dataframe(positions_df)
         
         # Test market data
-        # Test market data
         st.subheader("Market Data Test")
         try:
-            st.info("Requesting AAPL market data...")
+            st.info("Requesting AAPL market data using events...")
             
-            # Use delayed data type (3) instead of real-time (1)
-            ib.reqMarketDataType(1)
+            # Create a place to store the ticker data
+            if 'ticker_data' not in st.session_state:
+                st.session_state.ticker_data = None
             
-            # Create contract and qualify it
-            stock = Stock('AAPL', 'SMART', 'USD')
-            ib.qualifyContracts(stock)
-            
-            # Request market data with simplified parameters
-            ticker = ib.reqMktData(stock)
-            
-            # Wait longer and show more details
-            progress_bar = st.progress(0)
-            st.text("Waiting for market data to arrive...")
-            
-            # Initialize data display
-            data_display = st.empty()
-            
-            # Wait with more feedback
-            for i in range(20):  # Wait longer (10 seconds)
-                progress_bar.progress((i+1)/20)
-                
-                # Show the current state of the ticker
-                ticker_data = {
+            # Function to handle ticker updates
+            def on_ticker_update(ticker):
+                # Store the updated ticker data in session state
+                st.session_state.ticker_data = {
                     'Market Price': ticker.marketPrice(),
                     'Last': ticker.last,
                     'Bid': ticker.bid,
                     'Ask': ticker.ask,
                     'Close': ticker.close,
+                    'Volume': ticker.volume,
                     'Time': ticker.time,
-                    'Has Market Data': hasattr(ticker, 'marketPrice') and ticker.marketPrice() is not None
+                    'Has Data': ticker.last is not None or ticker.bid is not None or ticker.ask is not None
                 }
-                data_display.json(ticker_data)
+            
+            # Create contract and qualify it
+            stock = Stock('AAPL', 'SMART', 'USD')
+            ib.qualifyContracts(stock)
+            
+            # Try alternative methods
+            st.text("Method 1: Using reqMktData with events")
+            
+            # Request market data and register event handler
+            ticker = ib.reqMktData(stock, '', False, False)
+            ticker.updateEvent += on_ticker_update
+            
+            # Wait with progress bar
+            progress_bar = st.progress(0)
+            data_display = st.empty()
+            
+            for i in range(20):
+                progress_bar.progress((i+1)/20)
                 
-                # If we get a price, we can break early
-                if ticker.marketPrice() is not None and ticker.marketPrice() > 0:
-                    break
+                # Show the current state of the data
+                if st.session_state.ticker_data:
+                    data_display.json(st.session_state.ticker_data)
                     
-                time.sleep(0.5)
+                    # If we have actual data, break early
+                    if st.session_state.ticker_data.get('Has Data'):
+                        break
+                else:
+                    data_display.text("Waiting for ticker data...")
+                    
+                # Allow events to process
+                ib.sleep(0.5)
             
-            # Final data display
-            st.write("AAPL Market Data:")
-            
-            # More complete ticker data
-            final_ticker_data = {
-                'Market Price': ticker.marketPrice(),
-                'Last': ticker.last,
-                'Bid': ticker.bid,
-                'Ask': ticker.ask,
-                'Close': ticker.close,
-                'Open': ticker.open,
-                'High': ticker.high,
-                'Low': ticker.low,
-                'Volume': ticker.volume,
-                'Time': ticker.time
-            }
-            
-            st.write(final_ticker_data)
-            
-            # Check different price attributes in case marketPrice() is not working
-            price = ticker.marketPrice()
-            if price is None or price <= 0:
-                price = ticker.last
-                if price is None or price <= 0:
-                    price = (ticker.bid + ticker.ask) / 2 if ticker.bid and ticker.ask else None
-            
-            if price is not None and price > 0:
-                st.success(f"Successfully received market price: ${price:.2f}")
-            else:
-                st.warning("Did not receive a valid market price. Check market data permissions.")
+            # If first method failed, try method 2
+            if not st.session_state.ticker_data or not st.session_state.ticker_data.get('Has Data'):
+                st.text("Method 1 failed. Trying Method 2: Using reqTickers")
+                ib.cancelMktData(stock)  # Cancel the previous request
                 
-            # Show some debugging info about the ticker
-            with st.expander("Ticker Debug Info"):
-                st.text(f"Ticker has marketPrice attribute: {hasattr(ticker, 'marketPrice')}")
-                st.text(f"Ticker modelGreeks: {ticker.modelGreeks}")
-                st.text(f"All ticker attributes: {dir(ticker)}")
-                
-            # Clean up when done by canceling the market data
-            ib.cancelMktData(stock)
+                # Try using reqTickers instead
+                tickers = ib.reqTickers(stock)
+                if tickers:
+                    st.session_state.ticker_data = {
+                        'Market Price': tickers[0].marketPrice(),
+                        'Last': tickers[0].last,
+                        'Bid': tickers[0].bid,
+                        'Ask': tickers[0].ask,
+                        'Method': 'reqTickers'
+                    }
+                    data_display.json(st.session_state.ticker_data)
             
+            # If second method also failed, try method 3
+            if not st.session_state.ticker_data or not st.session_state.ticker_data.get('Has Data'):
+                st.text("Method 2 failed. Trying Method 3: Manual market snapshot")
+                
+                # Try one more approach - get a complete market snapshot
+                contract = Stock('AAPL', 'SMART', 'USD')
+                contract.exchange = 'SMART'
+                ib.qualifyContracts(contract)
+                
+                # Request a complete market snapshot
+                ticker = ib.reqMktData(contract, 'mdoff,233', False, False)
+                ib.sleep(2)  # Wait for the snapshot
+                
+                # Check the data
+                st.session_state.ticker_data = {
+                    'Contract': str(ticker.contract),
+                    'Last': ticker.last,
+                    'Bid': ticker.bid, 
+                    'Ask': ticker.ask,
+                    'Volume': ticker.volume,
+                    'Method': 'Market Snapshot'
+                }
+                data_display.json(st.session_state.ticker_data)
+            
+            # Final check
+            has_data = False
+            if st.session_state.ticker_data:
+                price = None
+                data = st.session_state.ticker_data
+                
+                if data.get('Last'):
+                    price = data['Last']
+                    has_data = True
+                elif data.get('Bid') and data.get('Ask'):
+                    price = (data['Bid'] + data['Ask']) / 2
+                    has_data = True
+                elif data.get('Market Price'):
+                    price = data['Market Price']
+                    has_data = True
+                    
+                if has_data and price:
+                    st.success(f"Successfully received price data: ${price:.2f}")
+                else:
+                    st.warning("Could not get valid price data through normal means")
+            
+            # Show some API diagnostic info
+            with st.expander("API Diagnostic Info"):
+                # Check API connectivity
+                managed_accounts = ib.client.getAccounts()
+                st.text(f"Connected accounts: {managed_accounts}")
+                
+                # Check market data permissions
+                st.text("Checking market data permissions...")
+                try:
+                    permissions = ib.reqMarketDataType(3)  # Request delayed data
+                    st.text(f"Market data type set to: 3 (Delayed)")
+                    
+                    # Try to check permissions directly
+                    snapshot_permissions = ticker.snapshotPermissions if hasattr(ticker, 'snapshotPermissions') else "Unknown"
+                    st.text(f"Snapshot permissions: {snapshot_permissions}")
+                except Exception as e:
+                    st.text(f"Error checking permissions: {e}")
+                    
+                # Show TWS settings that might be relevant
+                st.text("\nTWS Settings to Check:")
+                st.text("1. Edit > Global Configuration > API > Settings")
+                st.text("2. Market Data > Market Data Connections")
+                st.text("3. Make sure 'Enable API' is checked")
+                st.text("4. Try with 'Precautions' set to 'Bypass'")
+                    
+            # Clean up market data requests
+            try:
+                ib.cancelMktData(stock)
+            except:
+                pass
+                
         except Exception as e:
             st.error(f"Error testing market data: {e}")
             import traceback

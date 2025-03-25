@@ -29,8 +29,12 @@ st.set_page_config(
 
 st.title("Interactive Brokers Market Data Test")
 
-# Initialize a shared IB instance
-ib = IB()
+# Initialize a shared IB instance in session state
+if 'ib' not in st.session_state:
+    st.session_state.ib = IB()
+
+# Get the IB instance from session state
+ib = st.session_state.ib
 
 # Connect to TWS
 def connect_to_tws(client_id=None, readonly=True):
@@ -51,12 +55,29 @@ def connect_to_tws(client_id=None, readonly=True):
         # Display server info
         st.write(f"Server Version: {ib.client.serverVersion()}")
         
+        # Untested replacement for Claude's security hole.
+        # Get available accounts and select preferred if available
+        accounts = ib.client.getAccounts()
+        st.write(f"Available accounts: {accounts}")
+        
+        acct_num = st.text_input("Enter preferred account number")
+        if acct_num in accounts:
+            ib.client.setAccount(acct_num)
+            st.success(f"Selected preferred account: {acct_num}")
+        else:
+            st.warning("Preferred account not found in available accounts.")
+        
+        # Claude hard coded the account number.
+        #if '#########' in accounts:
+        #    ib.client.setAccount('#########')
+        #    st.success("Selected preferred account: #########")
+        
         return True
     except Exception as e:
         st.error(f"Connection failed: {e}")
         return False
 
-# Initialize session state
+# Initialize session state for market data
 if 'market_data' not in st.session_state:
     st.session_state.market_data = {}
 
@@ -70,6 +91,12 @@ with col2:
 
 if st.button("Connect to TWS"):
     connect_to_tws(client_id=client_id, readonly=readonly)
+
+# Connection status
+if ib.isConnected():
+    st.success("Connected to TWS")
+else:
+    st.error("Not connected to TWS")
 
 # Market Data Test Section
 st.header("Market Data Tests")
@@ -117,12 +144,14 @@ with col1:
                         }
                         st.text(f"Polling attempt {i+1}/10")
                         
+                        # Use ib.sleep instead of time.sleep
+                        # This processes events better
+                        ib.sleep(1)
+                        
                         # Check if we have data
                         if (ticker.last or ticker.bid or ticker.ask):
                             st.success(f"Got data with market data type {mdt}!")
                             break
-                            
-                        ib.sleep(1)
                     
                     # Clean up
                     ib.cancelMktData(contract)
@@ -139,9 +168,9 @@ with col1:
                 st.error(f"Error with reqMktData: {e}")
 
 with col2:
-    st.subheader("Method 2: reqTickers")
+    st.subheader("Method 2: Event-Based")
     
-    if st.button("Test reqTickers"):
+    if st.button("Test Event-Based"):
         if not ib.isConnected():
             st.error("Please connect to TWS first")
         else:
@@ -153,34 +182,50 @@ with col2:
                 contract = Stock(symbol, 'SMART', 'USD')
                 ib.qualifyContracts(contract)
                 
-                # Request tickers
-                st.text("Requesting tickers...")
-                tickers = ib.reqTickers(contract)
+                # Create a result container
+                result_container = st.empty()
                 
-                # Check results
-                if tickers:
-                    ticker = tickers[0]
+                # Event handler for ticker updates
+                def on_ticker_update(ticker):
+                    # Update session state
                     st.session_state.market_data['method2'] = {
                         'Market Price': ticker.marketPrice(),
                         'Last': ticker.last,
                         'Bid': ticker.bid,
                         'Ask': ticker.ask,
-                        'Time': ticker.time
+                        'Time': ticker.time,
+                        'Last Update': datetime.now().strftime("%H:%M:%S.%f")
                     }
-                    
-                    if (ticker.last or ticker.bid or ticker.ask):
-                        st.success("Got data with reqTickers!")
-                    else:
-                        st.warning("reqTickers returned a ticker, but no price data")
-                else:
-                    st.warning("reqTickers returned no tickers")
                 
-                # Show result
-                st.subheader("Result")
+                # Request market data and register the event handler
+                ticker = ib.reqMktData(contract)
+                ticker.updateEvent += on_ticker_update
+                
+                # Wait for data with better event processing
+                st.text("Waiting for data events...")
+                for i in range(10):
+                    # Display current status
+                    result_container.json(st.session_state.market_data['method2'])
+                    
+                    # Use ib.sleep to process events properly
+                    ib.sleep(1)
+                    
+                    # Check if we have data
+                    if ('Last Update' in st.session_state.market_data['method2']):
+                        data = st.session_state.market_data['method2']
+                        if (data.get('Last') or data.get('Bid') or data.get('Ask')):
+                            st.success("Got data via events!")
+                            break
+                
+                # Clean up
+                ib.cancelMktData(contract)
+                
+                # Show final result
+                st.subheader("Final Result")
                 st.json(st.session_state.market_data['method2'])
                 
             except Exception as e:
-                st.error(f"Error with reqTickers: {e}")
+                st.error(f"Error with event-based method: {e}")
 
 with col3:
     st.subheader("Method 3: Async Method")
@@ -192,6 +237,9 @@ with col3:
             try:
                 # Clear previous data
                 st.session_state.market_data['method3'] = {'status': 'Running...'}
+                
+                # Create a result container
+                result_container = st.empty()
                 
                 # Define async function
                 async def get_market_data_async():
@@ -213,6 +261,9 @@ with col3:
                             'Time': ticker.time,
                             'Attempt': i+1
                         }
+                        
+                        # Display current state
+                        result_container.json(st.session_state.market_data['method3'])
                         
                         # Check if we have data
                         if (ticker.last or ticker.bid or ticker.ask):
@@ -308,4 +359,19 @@ if st.button("Check TWS Status"):
 if ib.isConnected() and st.button("Disconnect"):
     ib.disconnect()
     st.success("Disconnected from TWS")
-    st.experimental_rerun()
+    
+# Proper cleanup on exit
+import atexit
+
+def cleanup():
+    """Clean up resources before exit"""
+    try:
+        if ib.isConnected():
+            print("Disconnecting from TWS...")
+            ib.disconnect()
+        print("Cleanup complete.")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+# Register cleanup function to be called on exit
+atexit.register(cleanup)
