@@ -3,3 +3,7 @@
 options_cache.db
 options_cache.db-journal
 
+
+__pycache__/
+*.py[cod]
+*.log
