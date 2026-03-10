@@ -171,22 +171,13 @@ def display_debug_panel():
         st.write("### Debug Controls")
         if st.button("Force Reconnect"):
             # Use thread-safe way to request reconnection
-            if 'force_reconnect' not in st.session_state:
-                st.session_state.force_reconnect = True
+            st.session_state.force_reconnect = True
 """
 END: Debug helper functions for Interactive Brokers API integration
 """
 
 # Set the event loop policy first
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
-# Create a new event loop and set it as the current loop
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Now that we have an event loop, apply nest_asyncio
-import nest_asyncio
-nest_asyncio.apply()
 
 def safe_float_conversion(value_str):
     """Safely convert a string to float, handling various formats"""
@@ -199,33 +190,93 @@ def safe_float_conversion(value_str):
         clean_str = value_str.replace(locale.localeconv()['currency_symbol'], '')
         clean_str = clean_str.replace(',', '')
         try:
-            return float(clean_str)
+            value = float(clean_str)
+            return value if np.isfinite(value) else 0.0
         except ValueError:
             st.sidebar.warning(f"Could not convert '{value_str}' to float")
             return 0.0
     
     # Already a number
     try:
-        return float(value_str)
+        value = float(value_str)
+        return value if np.isfinite(value) else 0.0
     except (ValueError, TypeError):
         return 0.0
+
+
+def is_valid_number(value):
+    """True when value is a finite numeric scalar."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(numeric)
+
+
+def get_account_value(account_df, tag, numeric=False, default=0.0):
+    """
+    Read account values safely even when duplicate tags exist across accounts.
+    numeric=True aggregates duplicate numeric tags by summing them.
+    """
+    if tag not in account_df.index:
+        return default if numeric else None
+
+    value = account_df.loc[tag, 'Value']
+    if isinstance(value, pd.Series):
+        values = value.tolist()
+        if numeric:
+            return sum(safe_float_conversion(v) for v in values)
+        return values[0] if values else default
+
+    if numeric:
+        return safe_float_conversion(value)
+    return value
 
 # Define the helper function for other threads
 def setup_asyncio_event_loop():
     """Ensure there is an event loop available for the current thread"""
     try:
         loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Current event loop is closed")
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     return loop
 
+# eventkit (used by ib_insync) expects an event loop during import.
+setup_asyncio_event_loop()
+
 # Now import ib_insync after setting up the asyncio environment
 from ib_insync import *
 
 
+def configure_locale():
+    """Configure locale with safe fallbacks across environments."""
+    for candidate in ("", "en_US.UTF-8", "C.UTF-8", "C"):
+        try:
+            locale.setlocale(locale.LC_ALL, candidate)
+            return locale.setlocale(locale.LC_ALL, None)
+        except locale.Error:
+            continue
+    return None
+
+
+def format_currency(value):
+    """Format currency even when locale-based formatting is unavailable."""
+    numeric_value = safe_float_conversion(value)
+    try:
+        return locale.currency(numeric_value, grouping=True)
+    except Exception:
+        return f"${numeric_value:,.2f}"
+
+
 # Set locale for proper currency formatting
-locale.setlocale(locale.LC_ALL, '')
+active_locale = configure_locale()
+if active_locale:
+    logger.info(f"Using locale: {active_locale}")
+else:
+    logger.warning("No supported locale found; currency formatting will use fallback.")
 
 # Global variables - remove threading elements
 
@@ -233,6 +284,8 @@ locale.setlocale(locale.LC_ALL, '')
 @st.cache_resource
 def get_ib():
     ib = IB()
+    # Avoid indefinite hangs on synchronous request wrappers.
+    ib.RequestTimeout = 20
     return ib
 
 ib = get_ib()
@@ -286,30 +339,15 @@ def connect_to_ib():
             # Add diagnostic information
             log_debug("Checking account data availability...", ui_container=debug_container)
             
-            # Test if we can get account info with timeout handling
+            # Test if we can get account info
             try:
-                log_debug("Requesting account summary data (async)...", ui_container=debug_container)
-                
-                # Use run_async with a timeout - this might be where it's hanging
-                async def get_account_with_timeout():
-                    try:
-                        log_debug("Starting accountSummaryAsync call", ui_container=debug_container)
-                        account_values = await ib.accountSummaryAsync()
-                        log_debug(f"accountSummaryAsync completed with {len(account_values) if account_values else 0} values", ui_container=debug_container)
-                        return account_values
-                    except Exception as async_error:
-                        log_debug(f"accountSummaryAsync error: {async_error}", "error", ui_container=debug_container)
-                        log_debug(traceback.format_exc(), "error", display_ui=False)
-                        return None
-                
-                # Run with a timeout
-                log_debug("Running account retrieval with timeout", ui_container=debug_container)
-                account_values = run_async(timeout_async(get_account_with_timeout(), timeout=15.0, operation_name="account data retrieval"))
-                
+                log_debug("Requesting account summary data...", ui_container=debug_container)
+                account_values = ib.accountSummary()
+
                 if account_values:
                     debug_state['account_data_received'] = True
                     log_debug(f"Successfully retrieved {len(account_values)} account values", "info", ui_container=debug_container)
-                    
+
                     # Display a sample of key values for diagnostics
                     account_sample = [val for val in account_values if val.tag in ['NetLiquidation', 'GrossPositionValue', 'TotalCashValue']]
                     if account_sample:
@@ -321,46 +359,26 @@ def connect_to_ib():
                         log_debug("No sample account values found in expected categories", "warning", ui_container=debug_container)
                 else:
                     log_debug("Account data returned empty. Check permissions in IB Gateway.", "warning", ui_container=debug_container)
-            except asyncio.TimeoutError:
-                log_debug("Timeout occurred while retrieving account data (15s). This may indicate a connection issue with TWS.", "error", ui_container=debug_container)
-                # Continue anyway - we might still be able to get positions
             except Exception as e:
                 log_debug(f"Error retrieving account data: {e}", "error", ui_container=debug_container)
                 log_debug(traceback.format_exc(), "error", display_ui=False)
                 # Continue anyway - we might still be able to get positions
-                
-            # Test if we can get positions with timeout handling
+
+            # Test if we can get positions
             try:
-                log_debug("Requesting position data (async)...", ui_container=debug_container)
-                
-                # Use run_async with a timeout
-                async def get_positions_with_timeout():
-                    try:
-                        log_debug("Starting positionsAsync call", ui_container=debug_container)
-                        positions = await ib.positionsAsync()
-                        log_debug(f"positionsAsync completed with {len(positions) if positions else 0} positions", ui_container=debug_container)
-                        return positions
-                    except Exception as async_error:
-                        log_debug(f"positionsAsync error: {async_error}", "error", ui_container=debug_container)
-                        log_debug(traceback.format_exc(), "error", display_ui=False)
-                        return None
-                
-                # Run with a timeout
-                log_debug("Running position retrieval with timeout", ui_container=debug_container)
-                positions = run_async(timeout_async(get_positions_with_timeout(), timeout=15.0, operation_name="position data retrieval"))
-                
+                log_debug("Requesting position data...", ui_container=debug_container)
+                positions = ib.positions()
+
                 if positions:
                     debug_state['positions_received'] = True
                     log_debug(f"Successfully retrieved {len(positions)} positions", ui_container=debug_container)
-                    
+
                     # Show a sample position for diagnostics
                     if len(positions) > 0:
                         pos = positions[0]
                         log_debug(f"Example position: {pos.contract.symbol}, {pos.position} @ {pos.avgCost}", ui_container=debug_container)
                 else:
                     log_debug("No positions found. If you expect positions, check IB Gateway permissions.", "warning", ui_container=debug_container)
-            except asyncio.TimeoutError:
-                log_debug("Timeout occurred while retrieving position data (15s)", "error", ui_container=debug_container)
             except Exception as e:
                 log_debug(f"Error retrieving positions: {e}", "error", ui_container=debug_container)
                 log_debug(traceback.format_exc(), "error", display_ui=False)
@@ -377,12 +395,39 @@ def connect_to_ib():
 
 # Function to safely run async code
 def run_async(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    """
+    Run async work without creating/closing a brand-new event loop per call.
+    Closing loops here caused intermittent timeouts and shutdown errors.
+    """
     try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        return util.run(coro)
+    except RuntimeError as runtime_error:
+        if "event loop is closed" in str(runtime_error).lower():
+            setup_asyncio_event_loop()
+            return util.run(coro)
+        raise
+
+
+async def get_account_summary_compat(ib, timeout=20.0):
+    """
+    Fetch account summary across ib_insync versions.
+    Some versions expose accountSummaryAsync, others only accountSummary.
+    """
+    if hasattr(ib, "accountSummaryAsync"):
+        account_summary_task = asyncio.create_task(ib.accountSummaryAsync())
+        return await asyncio.wait_for(account_summary_task, timeout=timeout)
+    return await asyncio.wait_for(asyncio.to_thread(ib.accountSummary), timeout=timeout)
+
+
+async def get_positions_compat(ib, timeout=20.0):
+    """
+    Fetch positions across ib_insync versions.
+    Some versions expose positionsAsync, others only positions.
+    """
+    if hasattr(ib, "positionsAsync"):
+        positions_task = asyncio.create_task(ib.positionsAsync())
+        return await asyncio.wait_for(positions_task, timeout=timeout)
+    return await asyncio.wait_for(asyncio.to_thread(ib.positions), timeout=timeout)
 
 # Async wrapper for portfolio data with improved debugging and timeout handling
 @time_operation("Portfolio Data Retrieval")
@@ -396,8 +441,7 @@ async def async_get_portfolio_data(ib):
         
         try:
             # Fetch account summary with a timeout
-            account_summary_task = asyncio.create_task(ib.accountSummaryAsync())
-            account_summary = await asyncio.wait_for(account_summary_task, timeout=10.0)
+            account_summary = await get_account_summary_compat(ib, timeout=20.0)
             
             if not account_summary:
                 log_debug("Account summary is empty", "warning")
@@ -413,7 +457,7 @@ async def async_get_portfolio_data(ib):
             debug_state['account_data_received'] = True
             
         except asyncio.TimeoutError:
-            log_debug("Timeout occurred while waiting for account data", "error")
+            log_debug("Timeout occurred while waiting for account data (20s)", "error")
             return None, None, None
         except Exception as account_error:
             log_debug(f"Error getting account data: {account_error}", "error")
@@ -425,31 +469,25 @@ async def async_get_portfolio_data(ib):
         
         try:
             # Fetch positions with a timeout
-            positions_task = asyncio.create_task(ib.positionsAsync())
-            positions = await asyncio.wait_for(positions_task, timeout=10.0)
-            
+            positions = await get_positions_compat(ib, timeout=20.0)
+            positions = positions or []
             if not positions:
                 log_debug("No positions found", "warning")
-                # Return account data even if no positions
-                return account_df, pd.DataFrame(), {}
-                
-            log_debug(f"Got {len(positions)} positions", "info")
-            
-            # Update debug state
-            debug_state['positions_received'] = True
+            else:
+                log_debug(f"Got {len(positions)} positions", "info")
+                debug_state['positions_received'] = True
             
         except asyncio.TimeoutError:
-            log_debug("Timeout occurred while waiting for position data", "error")
-            # Return account data even if positions timed out
-            return account_df, pd.DataFrame(), {}
+            log_debug("Timeout occurred while waiting for position data (20s)", "error")
+            positions = []
         except Exception as positions_error:
             log_debug(f"Error getting positions: {positions_error}", "error")
             log_debug(traceback.format_exc(), "error", display_ui=False)
-            # Return account data even if positions failed
-            return account_df, pd.DataFrame(), {}
+            positions = []
         
         # Create a dictionary to store positions by underlying
         positions_by_underlying = {}
+        underlying_price_cache = {}
         
         # Process positions
         log_debug("Processing positions...", "info")
@@ -465,53 +503,40 @@ async def async_get_portfolio_data(ib):
                 
                 log_debug(f"Processing position {position_count}/{len(positions)}: {underlying_symbol}", "debug", display_ui=False)
                 
-                # Get market price for the underlying
-                if contract.secType == 'STK':
-                    underlying_contract = contract
+                if underlying_symbol in underlying_price_cache:
+                    underlying_price = underlying_price_cache[underlying_symbol]
                 else:
-                    # For options, get the underlying price
-                    underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
+                    # Get market price once per underlying symbol.
+                    if contract.secType == 'STK':
+                        underlying_contract = contract
+                    else:
+                        underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
+
                     try:
-                        await asyncio.wait_for(ib.qualifyContractsAsync(underlying_contract), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        log_debug(f"Timeout qualifying contract for {underlying_symbol}", "warning")
-                        # Skip this position
+                        ticker = ib.reqMktData(underlying_contract)
+                        await asyncio.sleep(0.15)
+                    except Exception as ticker_error:
+                        log_debug(f"Error requesting market data for {underlying_symbol}: {ticker_error}", "warning")
                         position_errors += 1
                         continue
-                
-                # Use ticker to get real-time price updates
-                try:
-                    ticker = ib.reqMktData(underlying_contract)
-                    await asyncio.sleep(0.2)  # Small delay to respect rate limits
-                except Exception as ticker_error:
-                    log_debug(f"Error requesting market data for {underlying_symbol}: {ticker_error}", "warning")
-                    position_errors += 1
-                    continue
-                
-                underlying_price = ticker.marketPrice()
-                
-                # Handle missing price data with more detailed logging
-                if underlying_price is None or underlying_price <= 0:
-                    log_debug(f"No market price for {underlying_symbol}, trying last price", "debug", display_ui=False)
-                    
-                    # Try last price
-                    underlying_price = ticker.last
-                    if underlying_price is None or underlying_price <= 0:
-                        log_debug(f"No last price for {underlying_symbol}, trying mid price", "debug", display_ui=False)
-                        
-                        # Try mid price
-                        underlying_price = (ticker.ask + ticker.bid) / 2 if ticker.ask and ticker.bid else None
-                        if underlying_price is None or underlying_price <= 0:
-                            log_debug(f"No mid price for {underlying_symbol}, falling back to alternatives", "debug", display_ui=False)
-                            
-                            # Use average cost as last resort
-                            if contract.secType == 'STK':
-                                underlying_price = pos.avgCost
-                                log_debug(f"No market price for {underlying_symbol}, using avg cost: {underlying_price}", "warning")
-                            else:
-                                # For options without price data, set a placeholder
-                                log_debug(f"No price data for {underlying_symbol}, using 100 as placeholder", "warning")
-                                underlying_price = 100  # Arbitrary placeholder
+
+                    price_candidates = [ticker.marketPrice(), ticker.last]
+                    if is_valid_number(ticker.bid) and is_valid_number(ticker.ask):
+                        price_candidates.append((float(ticker.ask) + float(ticker.bid)) / 2.0)
+
+                    underlying_price = next((float(px) for px in price_candidates if is_valid_number(px) and float(px) > 0), None)
+
+                    if underlying_price is None:
+                        # Use average cost as a last resort instead of NaN/None.
+                        fallback_price = safe_float_conversion(pos.avgCost)
+                        if fallback_price > 0:
+                            underlying_price = fallback_price
+                            log_debug(f"No market price for {underlying_symbol}, using avg cost: {underlying_price}", "warning")
+                        else:
+                            underlying_price = 100.0
+                            log_debug(f"No price data for {underlying_symbol}, using 100 placeholder", "warning")
+
+                    underlying_price_cache[underlying_symbol] = underlying_price
                 
                 if position_count <= 5:  # Show debug for first few positions
                     log_debug(f"Position {position_count}: {underlying_symbol} @ {underlying_price}", "debug")
@@ -580,15 +605,18 @@ async def async_get_portfolio_data(ib):
         # Calculate portfolio metrics
         log_debug("Calculating metrics...", "info")
         try:
-            nlv = safe_float_conversion(account_df.loc['NetLiquidation', 'Value'])
-            gross_pos_val = safe_float_conversion(account_df.loc['GrossPositionValue', 'Value'])
+            nlv = get_account_value(account_df, 'NetLiquidation', numeric=True, default=0.0)
+            gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
+
+            if not is_valid_number(total_npv):
+                total_npv = 0.0
             
             # Calculate notional leverage ratio
             notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
             standard_leverage_ratio = gross_pos_val / nlv if nlv > 0 else 0
             
             # Add NGAV and NLR to account summary
-            account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = locale.currency(total_npv, grouping=True)
+            account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = format_currency(total_npv)
             account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
             account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
             
@@ -622,46 +650,24 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
     # Calculate option delta (if available, otherwise use approximation)
     delta = None
     option_price = option_ticker_task.marketPrice()
+    if not is_valid_number(option_price) or float(option_price) < 0:
+        option_price = 0.0
+    else:
+        option_price = float(option_price)
     
     if hasattr(option_ticker_task, 'modelGreeks') and option_ticker_task.modelGreeks:
-        delta = option_ticker_task.modelGreeks.delta
+        model_delta = option_ticker_task.modelGreeks.delta
+        if is_valid_number(model_delta):
+            delta = float(model_delta)
         log_debug(f"Got delta from model Greeks: {delta}", "debug", display_ui=False)
-    else:
-        log_debug("No model Greeks available, trying to calculate", "debug", display_ui=False)
-        
-        # Request option computation with timeout
-        try:
-            await asyncio.wait_for(ib.reqMarketDataTypeAsync(4), timeout=2.0)  # Switch to delayed frozen data
-            
-            try:
-                await asyncio.wait_for(
-                    ib.calculateImpliedVolatilityAsync(contract, option_price, underlying_price),
-                    timeout=2.0
-                )
-                await asyncio.sleep(0.2)
-                
-                await asyncio.wait_for(
-                    ib.calculateOptionPriceAsync(contract, option_ticker_task.impliedVolatility, underlying_price),
-                    timeout=2.0
-                )
-                await asyncio.sleep(0.2)
-                
-                # Try again to get delta
-                if hasattr(option_ticker_task, 'modelGreeks') and option_ticker_task.modelGreeks:
-                    delta = option_ticker_task.modelGreeks.delta
-                    log_debug(f"Got delta after calculation: {delta}", "debug", display_ui=False)
-            except Exception as calc_error:
-                log_debug(f"Option calculation error: {calc_error}", "debug", display_ui=False)
-        except asyncio.TimeoutError:
-            log_debug("Timeout during option calculations", "debug", display_ui=False)
-        
-        # Fallback delta calculation if still None
-        if delta is None:
-            if contract.right == 'C':  # Call option
-                delta = 0.7 if underlying_price > contract.strike else 0.3
-            else:  # Put option
-                delta = -0.7 if underlying_price < contract.strike else -0.3
-            log_debug(f"Using fallback delta: {delta}", "debug", display_ui=False)
+
+    # Fallback delta calculation when model greeks are unavailable or invalid.
+    if delta is None:
+        if contract.right == 'C':  # Call option
+            delta = 0.7 if underlying_price > contract.strike else 0.3
+        else:  # Put option
+            delta = -0.7 if underlying_price < contract.strike else -0.3
+        log_debug(f"Using fallback delta: {delta}", "debug", display_ui=False)
     
     # Use absolute value of delta for notional calculation
     abs_delta = abs(delta)
@@ -892,7 +898,7 @@ if st.sidebar.button("Test API Data Access"):
             # Test account data
             try:
                 st.write("Requesting account data...")
-                account_values = run_async(ib.accountSummaryAsync())
+                account_values = ib.accountSummary()
                 st.write(f"Received {len(account_values)} account values")
                 
                 # Display sample
@@ -908,7 +914,7 @@ if st.sidebar.button("Test API Data Access"):
             # Test positions
             try:
                 st.write("Requesting positions...")
-                positions = run_async(ib.positionsAsync())
+                positions = ib.positions()
                 st.write(f"Received {len(positions)} positions")
                 
                 # Display sample
@@ -952,8 +958,8 @@ def main():
             try:
                 ib.disconnect()
                 log_debug("Disconnected for force reconnect", "info")
-            except:
-                log_debug("Error during disconnect for force reconnect", "warning")
+            except Exception as disconnect_error:
+                log_debug(f"Error during disconnect for force reconnect: {disconnect_error}", "warning")
         st.session_state.force_reconnect = False
     
     # Try to connect if not already connected
@@ -982,25 +988,25 @@ def main():
                         
                         # Extract key metrics
                         try:
-                            nlv = safe_float_conversion(account_df.loc['NetLiquidation', 'Value'])
-                            gross_pos_val = safe_float_conversion(account_df.loc['GrossPositionValue', 'Value'])
-                            ngav = safe_float_conversion(account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'])
-                            nlr = float(account_df.loc['NLR (Notional Leverage Ratio)', 'Value'])
-                            std_leverage = float(account_df.loc['Standard Leverage Ratio', 'Value'])
+                            nlv = get_account_value(account_df, 'NetLiquidation', numeric=True, default=0.0)
+                            gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
+                            ngav = get_account_value(account_df, 'NGAV (Notional Gross Asset Value)', numeric=True, default=0.0)
+                            nlr = get_account_value(account_df, 'NLR (Notional Leverage Ratio)', numeric=True, default=0.0)
+                            std_leverage = get_account_value(account_df, 'Standard Leverage Ratio', numeric=True, default=0.0)
+                            buying_power = get_account_value(account_df, 'BuyingPower', numeric=True, default=0.0)
                             
                             metrics_cols[0].metric("Net Liquidation Value", 
-                                                 locale.currency(nlv, grouping=True))
+                                                 format_currency(nlv))
                             metrics_cols[1].metric("Gross Position Value", 
-                                                 locale.currency(gross_pos_val, grouping=True))
+                                                 format_currency(gross_pos_val))
                             metrics_cols[2].metric("NGAV", 
-                                                 locale.currency(ngav, grouping=True))
+                                                 format_currency(ngav))
                             metrics_cols[3].metric("Standard Leverage", 
                                                  f"{std_leverage:.2f}x")
                             metrics_cols[4].metric("Notional Leverage Ratio", 
                                                  f"{nlr:.2f}x")
                             metrics_cols[5].metric("Buying Power", 
-                                                 account_df.loc['BuyingPower', 'Value'] 
-                                                 if 'BuyingPower' in account_df.index else "N/A")
+                                                 format_currency(buying_power))
                         except Exception as e:
                             log_debug(f"Error updating metrics: {e}", "error")
                     except Exception as container_error:
@@ -1014,7 +1020,7 @@ def main():
                         display_df = underlying_df.copy()
                         for col in ['Stock Value', 'Option Notional Value', 'Option Actual Value', 'Notional Position Value (NPV)']:
                             if col in display_df.columns:
-                                display_df[col] = display_df[col].apply(lambda x: locale.currency(x, grouping=True))
+                                display_df[col] = display_df[col].apply(format_currency)
                         
                         # Format underlying price
                         if 'Underlying Price' in display_df.columns:
@@ -1107,7 +1113,7 @@ def add_advanced_debug_section():
                     st.error("Not connected to TWS")
                 else:
                     try:
-                        account_values = run_async(ib.accountSummaryAsync())
+                        account_values = ib.accountSummary()
                         if account_values:
                             st.success(f"Received {len(account_values)} account values directly")
                             # Show first few items
