@@ -232,6 +232,172 @@ def get_account_value(account_df, tag, numeric=False, default=0.0):
         return safe_float_conversion(value)
     return value
 
+
+def pick_price_from_ticker(ticker):
+    """Return the best available positive finite price from an IB ticker."""
+    if ticker is None:
+        return None
+
+    candidates = [ticker.marketPrice(), ticker.last, ticker.close]
+    if is_valid_number(ticker.bid) and is_valid_number(ticker.ask):
+        candidates.append((float(ticker.bid) + float(ticker.ask)) / 2.0)
+
+    for candidate in candidates:
+        if is_valid_number(candidate) and float(candidate) > 0:
+            return float(candidate)
+    return None
+
+
+def option_contract_key(contract):
+    """Stable key for an option contract across data sources."""
+    return (
+        contract.symbol,
+        contract.lastTradeDateOrContractMonth,
+        float(contract.strike),
+        contract.right,
+        str(contract.multiplier or '100'),
+        contract.tradingClass or contract.symbol
+    )
+
+
+def contract_multiplier(contract, default=100):
+    """Extract a sane integer multiplier from an IB contract."""
+    try:
+        if contract.multiplier:
+            return int(float(contract.multiplier))
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def option_delta_from_ticker(ticker):
+    """Pick the best available delta from IB option greek fields."""
+    if ticker is None:
+        return None
+
+    for greek_field in ("modelGreeks", "bidGreeks", "askGreeks", "lastGreeks"):
+        greeks = getattr(ticker, greek_field, None)
+        if not greeks:
+            continue
+        delta = getattr(greeks, "delta", None)
+        if is_valid_number(delta):
+            return float(delta)
+    return None
+
+
+def option_underlying_price_from_ticker(ticker):
+    """Pick underlying price from option greek fields when available."""
+    if ticker is None:
+        return None
+
+    for greek_field in ("modelGreeks", "bidGreeks", "askGreeks", "lastGreeks"):
+        greeks = getattr(ticker, greek_field, None)
+        if not greeks:
+            continue
+        und_price = getattr(greeks, "undPrice", None)
+        if is_valid_number(und_price) and float(und_price) > 0:
+            return float(und_price)
+    return None
+
+
+def chunked(items, size):
+    """Yield fixed-size chunks from a list-like collection."""
+    for idx in range(0, len(items), size):
+        yield items[idx:idx + size]
+
+
+def bounded_req_tickers(ib, contracts, timeout_seconds=2.0, chunk_size=8, label="ticker"):
+    """
+    Request market data snapshots with bounded timeout/chunking so one slow request
+    does not stall the whole Streamlit rerun.
+    """
+    if not contracts:
+        return []
+
+    tickers = []
+    original_timeout = getattr(ib, "RequestTimeout", None)
+    try:
+        if original_timeout is None or not is_valid_number(original_timeout) or float(original_timeout) > timeout_seconds:
+            ib.RequestTimeout = timeout_seconds
+
+        for batch in chunked(contracts, chunk_size):
+            try:
+                tickers.extend(ib.reqTickers(*batch))
+            except Exception as batch_error:
+                log_debug(f"{label} batch request failed for {len(batch)} contracts: {batch_error}", "warning")
+    finally:
+        if original_timeout is not None:
+            ib.RequestTimeout = original_timeout
+
+    return tickers
+
+
+def gather_option_market_data(ib, contracts, wait_seconds=0.6, chunk_size=6):
+    """
+    Request option market data in short-lived streaming batches.
+    This avoids repeated reqTickers timeouts when option snapshots are slow.
+    """
+    ticker_by_key = {}
+    for batch in chunked(contracts, chunk_size):
+        active = []
+        for contract in batch:
+            try:
+                ticker = ib.reqMktData(contract, genericTickList='106')
+                active.append((contract, ticker))
+            except Exception as request_error:
+                log_debug(f"Option market data request failed for {contract.localSymbol}: {request_error}", "warning")
+
+        if not active:
+            continue
+
+        try:
+            ib.sleep(wait_seconds)
+        except Exception as sleep_error:
+            log_debug(f"Option market data wait failed: {sleep_error}", "warning")
+
+        for contract, ticker in active:
+            ticker_by_key[option_contract_key(contract)] = ticker
+
+        for contract, _ in active:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
+
+    return ticker_by_key
+
+
+def gather_stock_market_data(ib, contracts, wait_seconds=0.5, chunk_size=12):
+    """Request stock market data in short-lived streaming batches."""
+    ticker_by_symbol = {}
+    for batch in chunked(contracts, chunk_size):
+        active = []
+        for contract in batch:
+            try:
+                ticker = ib.reqMktData(contract)
+                active.append((contract, ticker))
+            except Exception as request_error:
+                log_debug(f"Stock market data request failed for {contract.symbol}: {request_error}", "warning")
+
+        if not active:
+            continue
+
+        try:
+            ib.sleep(wait_seconds)
+        except Exception as sleep_error:
+            log_debug(f"Stock market data wait failed: {sleep_error}", "warning")
+
+        for contract, ticker in active:
+            ticker_by_symbol[contract.symbol] = ticker
+
+        for contract, _ in active:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
+
+    return ticker_by_symbol
+
 # Define the helper function for other threads
 def setup_asyncio_event_loop():
     """Ensure there is an event loop available for the current thread"""
@@ -288,6 +454,18 @@ def get_ib():
     ib.RequestTimeout = 20
     return ib
 
+
+@st.cache_resource
+def get_runtime_cache():
+    """
+    Process-lifetime cache for short-lived market data fallbacks.
+    Survives Streamlit reruns/browser refreshes, but values are TTL-pruned.
+    """
+    return {
+        'underlying_prices': {},
+        'option_deltas': {},
+    }
+
 ib = get_ib()
 
 # Connect to IB TWS
@@ -328,6 +506,12 @@ def connect_to_ib():
                 ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=connect_timeout)
                 connection_duration = time.time() - connection_start
                 log_debug(f"Connection established in {connection_duration:.2f}s", ui_container=debug_container)
+                try:
+                    # Use delayed-frozen market data when live subscriptions are unavailable.
+                    ib.reqMarketDataType(4)
+                    log_debug("Market data type set to delayed-frozen (4)", ui_container=debug_container)
+                except Exception as market_data_type_error:
+                    log_debug(f"Could not set delayed market data type: {market_data_type_error}", "warning", ui_container=debug_container)
             except Exception as connect_error:
                 log_debug(f"Connection failed: {connect_error}", "error", ui_container=debug_container)
                 log_debug(traceback.format_exc(), "error", display_ui=False)
@@ -416,7 +600,7 @@ async def get_account_summary_compat(ib, timeout=20.0):
     if hasattr(ib, "accountSummaryAsync"):
         account_summary_task = asyncio.create_task(ib.accountSummaryAsync())
         return await asyncio.wait_for(account_summary_task, timeout=timeout)
-    return await asyncio.wait_for(asyncio.to_thread(ib.accountSummary), timeout=timeout)
+    return ib.accountSummary()
 
 
 async def get_positions_compat(ib, timeout=20.0):
@@ -427,7 +611,7 @@ async def get_positions_compat(ib, timeout=20.0):
     if hasattr(ib, "positionsAsync"):
         positions_task = asyncio.create_task(ib.positionsAsync())
         return await asyncio.wait_for(positions_task, timeout=timeout)
-    return await asyncio.wait_for(asyncio.to_thread(ib.positions), timeout=timeout)
+    return ib.positions()
 
 # Async wrapper for portfolio data with improved debugging and timeout handling
 @time_operation("Portfolio Data Retrieval")
@@ -435,6 +619,10 @@ async def async_get_portfolio_data(ib):
     try:
         # Debug info
         log_debug("Starting portfolio data retrieval", "info")
+        try:
+            ib.reqMarketDataType(4)
+        except Exception as market_data_type_error:
+            log_debug(f"Unable to set delayed-frozen market data type: {market_data_type_error}", "warning")
         
         # Get account summary with timeout
         log_debug("Fetching account data...", "info")
@@ -514,17 +702,27 @@ async def async_get_portfolio_data(ib):
 
                     try:
                         ticker = ib.reqMktData(underlying_contract)
-                        await asyncio.sleep(0.15)
+                        underlying_price = None
+                        for _ in range(8):
+                            underlying_price = pick_price_from_ticker(ticker)
+                            if underlying_price is not None:
+                                break
+                            await asyncio.sleep(0.15)
+
+                        # Fallback to snapshot-style request if streaming fields are empty.
+                        if underlying_price is None:
+                            tickers = ib.reqTickers(underlying_contract)
+                            if tickers:
+                                underlying_price = pick_price_from_ticker(tickers[0])
                     except Exception as ticker_error:
                         log_debug(f"Error requesting market data for {underlying_symbol}: {ticker_error}", "warning")
                         position_errors += 1
                         continue
-
-                    price_candidates = [ticker.marketPrice(), ticker.last]
-                    if is_valid_number(ticker.bid) and is_valid_number(ticker.ask):
-                        price_candidates.append((float(ticker.ask) + float(ticker.bid)) / 2.0)
-
-                    underlying_price = next((float(px) for px in price_candidates if is_valid_number(px) and float(px) > 0), None)
+                    finally:
+                        try:
+                            ib.cancelMktData(underlying_contract)
+                        except Exception:
+                            pass
 
                     if underlying_price is None:
                         # Use average cost as a last resort instead of NaN/None.
@@ -587,7 +785,7 @@ async def async_get_portfolio_data(ib):
                     'Symbol': symbol,
                     'Stock Count': data['stock_count'],
                     'Stock Value': data['stock_value'],
-                    'Option Notional (Shares)': data['option_notional'] / 100,  # Convert to contract equivalents
+                    'Option Notional (Shares)': data['option_notional'],
                     'Option Notional Value': option_notional,
                     'Option Actual Value': data['option_actual_value'],
                     'Underlying Price': data['underlying_price'],
@@ -649,17 +847,18 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
     
     # Calculate option delta (if available, otherwise use approximation)
     delta = None
-    option_price = option_ticker_task.marketPrice()
-    if not is_valid_number(option_price) or float(option_price) < 0:
-        option_price = 0.0
-    else:
-        option_price = float(option_price)
-    
-    if hasattr(option_ticker_task, 'modelGreeks') and option_ticker_task.modelGreeks:
-        model_delta = option_ticker_task.modelGreeks.delta
-        if is_valid_number(model_delta):
-            delta = float(model_delta)
-        log_debug(f"Got delta from model Greeks: {delta}", "debug", display_ui=False)
+    option_price = pick_price_from_ticker(option_ticker_task) or 0.0
+
+    # Allow a short window for greeks to populate before falling back.
+    for _ in range(6):
+        if hasattr(option_ticker_task, 'modelGreeks') and option_ticker_task.modelGreeks:
+            model_delta = option_ticker_task.modelGreeks.delta
+            if is_valid_number(model_delta):
+                delta = float(model_delta)
+                break
+        await asyncio.sleep(0.1)
+
+    log_debug(f"Got delta from model Greeks: {delta}", "debug", display_ui=False)
 
     # Fallback delta calculation when model greeks are unavailable or invalid.
     if delta is None:
@@ -669,17 +868,478 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
             delta = -0.7 if underlying_price < contract.strike else -0.3
         log_debug(f"Using fallback delta: {delta}", "debug", display_ui=False)
     
-    # Use absolute value of delta for notional calculation
-    abs_delta = abs(delta)
+    # Signed share-equivalent notional (puts are negative delta).
     option_multiplier = 100
-    option_notional = abs_delta * option_multiplier * pos.position
+    option_notional = delta * option_multiplier * pos.position
     positions_by_underlying[underlying_symbol]['option_notional'] += option_notional
     
-    # Calculate actual option value
-    option_value = option_price * option_multiplier * abs(pos.position)
+    # Signed actual option value (short option value is negative).
+    option_value = option_price * option_multiplier * pos.position
     positions_by_underlying[underlying_symbol]['option_actual_value'] += option_value
     
+    try:
+        ib.cancelMktData(contract)
+    except Exception:
+        pass
+
     log_debug(f"Option processed: notional={option_notional}, value={option_value}", "debug", display_ui=False)
+
+@time_operation("Portfolio Data Retrieval")
+def get_portfolio_data_sync(ib):
+    """
+    Main synchronous portfolio data path.
+    Keeps IB requests on one thread/loop context to avoid nested event-loop errors.
+    """
+    log_debug("Starting portfolio data retrieval", "info")
+    try:
+        started_at = time.time()
+        try:
+            ib.reqMarketDataType(4)
+        except Exception as market_data_type_error:
+            log_debug(f"Unable to set delayed-frozen market data type: {market_data_type_error}", "warning")
+
+        log_debug("Fetching account data...", "info")
+        t0 = time.time()
+        account_summary = ib.accountSummary()
+        log_debug(f"Fetched account data in {time.time() - t0:.2f}s", "debug", display_ui=False)
+        if not account_summary:
+            log_debug("Account summary is empty", "warning")
+            return None, None, None
+
+        account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], columns=['Tag', 'Value'])
+        account_df = account_df.set_index('Tag')
+        debug_state['account_data_received'] = True
+
+        log_debug("Fetching positions...", "info")
+        t0 = time.time()
+        positions = ib.positions() or []
+        log_debug(f"Fetched positions in {time.time() - t0:.2f}s", "debug", display_ui=False)
+        if positions:
+            log_debug(f"Got {len(positions)} positions", "info")
+            debug_state['positions_received'] = True
+        else:
+            log_debug("No positions found", "warning")
+
+        t0 = time.time()
+        portfolio_items = ib.portfolio() or []
+        log_debug(f"Fetched portfolio items in {time.time() - t0:.2f}s", "debug", display_ui=False)
+
+        positions_by_underlying = {}
+        position_errors = 0
+
+        portfolio_by_account_conid = {}
+        portfolio_by_conid_any = {}
+        portfolio_by_account_option_key = {}
+        portfolio_by_option_key_any = {}
+        underlying_market_price_map = {}
+        underlying_price_source = {}
+        runtime_cache = get_runtime_cache()
+        persistent_underlying_price_cache = runtime_cache['underlying_prices']
+        persistent_option_delta_cache = runtime_cache['option_deltas']
+        cache_ttl_seconds = 180
+        now_ts = time.time()
+
+        def unpack_numeric_cache(raw_cache):
+            """Read numeric cache entries, honoring TTL for timestamped payloads."""
+            unpacked = {}
+            for key, payload in raw_cache.items():
+                if isinstance(payload, dict):
+                    value = payload.get('value')
+                    timestamp = safe_float_conversion(payload.get('ts'))
+                    if now_ts - timestamp <= cache_ttl_seconds and is_valid_number(value):
+                        unpacked[key] = float(value)
+                elif is_valid_number(payload):
+                    # Backward compatibility for older cache payload shape.
+                    unpacked[key] = float(payload)
+            return unpacked
+
+        # Prune stale entries from process-level caches.
+        for key, payload in list(persistent_underlying_price_cache.items()):
+            if isinstance(payload, dict):
+                if now_ts - safe_float_conversion(payload.get('ts')) > cache_ttl_seconds:
+                    del persistent_underlying_price_cache[key]
+        for key, payload in list(persistent_option_delta_cache.items()):
+            if isinstance(payload, dict):
+                if now_ts - safe_float_conversion(payload.get('ts')) > cache_ttl_seconds:
+                    del persistent_option_delta_cache[key]
+
+        for item in portfolio_items:
+            contract = item.contract
+            account = getattr(item, 'account', '')
+            con_id = getattr(contract, 'conId', 0)
+            if con_id:
+                portfolio_by_account_conid[(account, con_id)] = item
+                portfolio_by_conid_any.setdefault(con_id, item)
+
+            if contract.secType == 'OPT':
+                option_key = option_contract_key(contract)
+                portfolio_by_account_option_key[(account, option_key)] = item
+                portfolio_by_option_key_any.setdefault(option_key, item)
+            elif contract.secType == 'STK':
+                item_price = safe_float_conversion(getattr(item, 'marketPrice', None))
+                if not (item_price > 0):
+                    market_value = safe_float_conversion(getattr(item, 'marketValue', None))
+                    position_qty = safe_float_conversion(getattr(item, 'position', None))
+                    if position_qty != 0 and market_value != 0:
+                        item_price = abs(market_value / position_qty)
+                        if item_price > 0:
+                            underlying_price_source[contract.symbol] = "portfolio_derived"
+                if item_price > 0:
+                    underlying_market_price_map[contract.symbol] = item_price
+                    if contract.symbol not in underlying_price_source:
+                        underlying_price_source[contract.symbol] = "portfolio"
+                    persistent_underlying_price_cache[contract.symbol] = {
+                        'value': float(item_price),
+                        'ts': now_ts,
+                    }
+
+        # Persist last-known values so brief quote gaps do not regress to cost basis.
+        session_delta_cache = st.session_state.setdefault('option_delta_cache', {})
+        session_underlying_price_cache = st.session_state.setdefault('underlying_price_cache', {})
+        delta_cache = unpack_numeric_cache(persistent_option_delta_cache)
+        delta_cache.update(session_delta_cache)
+        underlying_price_cache = unpack_numeric_cache(persistent_underlying_price_cache)
+        underlying_price_cache.update(session_underlying_price_cache)
+
+        def cache_option_delta(key, delta_value):
+            if not is_valid_number(delta_value):
+                return
+            numeric_delta = float(delta_value)
+            delta_cache[key] = numeric_delta
+            session_delta_cache[key] = numeric_delta
+            persistent_option_delta_cache[key] = {
+                'value': numeric_delta,
+                'ts': time.time(),
+            }
+
+        def cache_underlying_price(symbol, price_value):
+            if not is_valid_number(price_value) or float(price_value) <= 0:
+                return
+            numeric_price = float(price_value)
+            underlying_price_cache[symbol] = numeric_price
+            session_underlying_price_cache[symbol] = numeric_price
+            persistent_underlying_price_cache[symbol] = {
+                'value': numeric_price,
+                'ts': time.time(),
+            }
+
+        option_contracts = []
+        seen_option_keys = set()
+        underlying_symbols = sorted({pos.contract.symbol for pos in positions if pos.contract.symbol})
+        for pos in positions:
+            contract = pos.contract
+            if contract.secType != 'OPT':
+                continue
+            key = option_contract_key(contract)
+            if key in seen_option_keys:
+                continue
+            seen_option_keys.add(key)
+            option_contract = Option(
+                contract.symbol,
+                contract.lastTradeDateOrContractMonth,
+                float(contract.strike),
+                contract.right,
+                contract.exchange or 'SMART',
+                contract.multiplier or '100',
+                contract.currency or 'USD',
+                tradingClass=contract.tradingClass or contract.symbol,
+            )
+            if getattr(contract, 'conId', 0):
+                option_contract.conId = contract.conId
+            option_contracts.append(option_contract)
+
+        # Pull option deltas/quotes and feed underlying prices from option greeks.
+        option_delta_map = {}
+        option_price_map = {}
+
+        def absorb_option_tickers(option_tickers):
+            for key, ticker in option_tickers.items():
+                delta = option_delta_from_ticker(ticker)
+                if is_valid_number(delta):
+                    option_delta_map[key] = float(delta)
+                    cache_option_delta(key, delta)
+
+                option_price = pick_price_from_ticker(ticker)
+                if option_price is not None:
+                    option_price_map[key] = option_price
+
+                underlying_symbol = key[0]
+                und_price = option_underlying_price_from_ticker(ticker)
+                if und_price is not None and underlying_symbol not in underlying_market_price_map:
+                    underlying_market_price_map[underlying_symbol] = und_price
+                    underlying_price_source[underlying_symbol] = "option_greeks"
+                    cache_underlying_price(underlying_symbol, und_price)
+
+        def fetch_missing_underlyings(wait_seconds, chunk_size, label):
+            missing_underlyings = [s for s in underlying_symbols if s not in underlying_market_price_map]
+            if not missing_underlyings:
+                return
+
+            t0 = time.time()
+            stock_contracts = [Stock(symbol, 'SMART', 'USD') for symbol in missing_underlyings]
+            stock_tickers = gather_stock_market_data(
+                ib,
+                stock_contracts,
+                wait_seconds=wait_seconds,
+                chunk_size=chunk_size,
+            )
+            log_debug(
+                f"{label}: requested {len(stock_contracts)} underlying streams in {time.time() - t0:.2f}s",
+                "debug",
+                display_ui=False,
+            )
+
+            for symbol, ticker in stock_tickers.items():
+                price = pick_price_from_ticker(ticker)
+                if price is not None:
+                    underlying_market_price_map[symbol] = price
+                    underlying_price_source[symbol] = "snapshot"
+                    cache_underlying_price(symbol, price)
+
+        if option_contracts:
+            t0 = time.time()
+            option_tickers = gather_option_market_data(
+                ib,
+                option_contracts,
+                wait_seconds=0.6,
+                chunk_size=6,
+            )
+            log_debug(
+                f"Requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s",
+                "debug",
+                display_ui=False,
+            )
+            absorb_option_tickers(option_tickers)
+
+        fetch_missing_underlyings(wait_seconds=0.5, chunk_size=12, label="Initial fetch")
+
+        # If live coverage is poor, do a slower second pass before relying on cache/fallback.
+        min_live_quotes = max(5, int(len(underlying_symbols) * 0.5))
+        if underlying_symbols and len(underlying_market_price_map) < min_live_quotes:
+            log_debug(
+                f"Low live quote coverage ({len(underlying_market_price_map)}/{len(underlying_symbols)}); retrying fetch",
+                "warning",
+                display_ui=False,
+            )
+            if option_contracts:
+                t0 = time.time()
+                option_tickers = gather_option_market_data(
+                    ib,
+                    option_contracts,
+                    wait_seconds=1.0,
+                    chunk_size=4,
+                )
+                log_debug(
+                    f"Retry fetch: requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s",
+                    "debug",
+                    display_ui=False,
+                )
+                absorb_option_tickers(option_tickers)
+
+            fetch_missing_underlyings(wait_seconds=1.0, chunk_size=8, label="Retry fetch")
+
+        for idx, pos in enumerate(positions, start=1):
+            try:
+                contract = pos.contract
+                underlying_symbol = contract.symbol
+                log_debug(f"Processing position {idx}/{len(positions)}: {underlying_symbol}", "debug", display_ui=False)
+
+                if underlying_symbol not in positions_by_underlying:
+                    positions_by_underlying[underlying_symbol] = {
+                        'stock_count': 0.0,
+                        'stock_value': 0.0,
+                        'option_notional': 0.0,
+                        'option_actual_value': 0.0,
+                        'underlying_market_price': None,
+                        'underlying_cost_basis_sum': 0.0,
+                        'underlying_cost_basis_qty': 0.0,
+                        'price_source': None,
+                    }
+
+                if contract.secType == 'STK':
+                    positions_by_underlying[underlying_symbol]['stock_count'] += pos.position
+
+                    con_id = getattr(contract, 'conId', 0)
+                    account = getattr(pos, 'account', '')
+                    portfolio_item = portfolio_by_account_conid.get((account, con_id))
+                    if portfolio_item is None and con_id:
+                        portfolio_item = portfolio_by_conid_any.get(con_id)
+                    stock_market_value = None
+                    if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'marketValue', None)):
+                        stock_market_value = float(portfolio_item.marketValue)
+                        if pos.position != 0:
+                            implied_price = abs(stock_market_value / float(pos.position))
+                            if implied_price > 0 and underlying_symbol not in underlying_market_price_map:
+                                underlying_market_price_map[underlying_symbol] = implied_price
+                                underlying_price_source[underlying_symbol] = "portfolio_value"
+                                cache_underlying_price(underlying_symbol, implied_price)
+
+                    if stock_market_value is None:
+                        known_market_price = underlying_market_price_map.get(underlying_symbol)
+                        if known_market_price is None:
+                            known_market_price = underlying_price_cache.get(underlying_symbol)
+                            if known_market_price is not None:
+                                underlying_price_source[underlying_symbol] = "cached"
+                        if is_valid_number(known_market_price) and float(known_market_price) > 0:
+                            stock_market_value = float(known_market_price) * pos.position
+                            underlying_market_price_map[underlying_symbol] = float(known_market_price)
+                            cache_underlying_price(underlying_symbol, known_market_price)
+
+                    if stock_market_value is None:
+                        fallback_cost = safe_float_conversion(pos.avgCost)
+                        stock_market_value = fallback_cost * pos.position
+                        if fallback_cost > 0:
+                            underlying_market_price_map.setdefault(underlying_symbol, fallback_cost)
+                            underlying_price_source.setdefault(underlying_symbol, "cost_basis")
+
+                    positions_by_underlying[underlying_symbol]['stock_value'] += stock_market_value
+
+                    abs_qty = abs(float(pos.position))
+                    avg_cost = safe_float_conversion(pos.avgCost)
+                    if abs_qty > 0 and avg_cost > 0:
+                        positions_by_underlying[underlying_symbol]['underlying_cost_basis_sum'] += abs_qty * avg_cost
+                        positions_by_underlying[underlying_symbol]['underlying_cost_basis_qty'] += abs_qty
+
+                elif contract.secType == 'OPT':
+                    key = option_contract_key(contract)
+                    multiplier = contract_multiplier(contract)
+
+                    delta = option_delta_map.get(key)
+                    if delta is None:
+                        cached_delta = delta_cache.get(key)
+                        if is_valid_number(cached_delta):
+                            delta = float(cached_delta)
+
+                    if delta is None:
+                        # Prefer explicit "unknown delta" over synthetic deltas.
+                        delta = 0.0
+
+                    option_notional_shares = delta * multiplier * pos.position
+                    positions_by_underlying[underlying_symbol]['option_notional'] += option_notional_shares
+
+                    con_id = getattr(contract, 'conId', 0)
+                    account = getattr(pos, 'account', '')
+                    portfolio_item = portfolio_by_account_conid.get((account, con_id))
+                    if portfolio_item is None and con_id:
+                        portfolio_item = portfolio_by_conid_any.get(con_id)
+                    if portfolio_item is None:
+                        portfolio_item = portfolio_by_account_option_key.get((account, key))
+                    if portfolio_item is None:
+                        portfolio_item = portfolio_by_option_key_any.get(key)
+
+                    option_actual_value = None
+                    if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'marketValue', None)):
+                        option_actual_value = float(portfolio_item.marketValue)
+
+                    if option_actual_value is None:
+                        option_price = option_price_map.get(key)
+                        if option_price is None:
+                            avg_cost_total = safe_float_conversion(pos.avgCost)
+                            option_price = avg_cost_total / multiplier if multiplier else 0.0
+                        option_actual_value = option_price * multiplier * pos.position
+
+                    positions_by_underlying[underlying_symbol]['option_actual_value'] += option_actual_value
+            except Exception as position_error:
+                log_debug(f"Error processing position {idx}: {position_error}", "warning")
+                position_errors += 1
+                continue
+
+        if position_errors > 0:
+            log_debug(f"Encountered errors in {position_errors}/{len(positions)} positions", "warning")
+
+        log_debug("Creating dataframe...", "info")
+        underlying_data = []
+        total_npv = 0.0
+
+        for symbol, data in positions_by_underlying.items():
+            try:
+                market_price = underlying_market_price_map.get(symbol)
+                if not (is_valid_number(market_price) and float(market_price) > 0):
+                    cached_price = underlying_price_cache.get(symbol)
+                    if is_valid_number(cached_price) and float(cached_price) > 0:
+                        market_price = float(cached_price)
+                        underlying_price_source[symbol] = "cached"
+
+                if not (is_valid_number(market_price) and float(market_price) > 0):
+                    if data['stock_count'] != 0 and is_valid_number(data['stock_value']):
+                        derived_price = abs(float(data['stock_value']) / float(data['stock_count']))
+                        if derived_price > 0:
+                            market_price = derived_price
+                            underlying_price_source[symbol] = "derived"
+
+                if not (is_valid_number(market_price) and float(market_price) > 0):
+                    qty = data['underlying_cost_basis_qty']
+                    if qty > 0:
+                        market_price = data['underlying_cost_basis_sum'] / qty
+                        underlying_price_source[symbol] = "cost_basis"
+
+                if not (is_valid_number(market_price) and float(market_price) > 0):
+                    market_price = 0.0
+                    underlying_price_source[symbol] = "unavailable"
+
+                cache_underlying_price(symbol, market_price)
+                cost_basis_price = 0.0
+                if data['underlying_cost_basis_qty'] > 0:
+                    cost_basis_price = data['underlying_cost_basis_sum'] / data['underlying_cost_basis_qty']
+
+                option_notional_value = data['option_notional'] * market_price
+                total_notional = data['stock_value'] + option_notional_value
+
+                underlying_data.append({
+                    'Symbol': symbol,
+                    'Stock Count': data['stock_count'],
+                    'Stock Value': data['stock_value'],
+                    'Option Notional (Shares)': data['option_notional'],
+                    'Option Notional Value': option_notional_value,
+                    'Option Actual Value': data['option_actual_value'],
+                    'Underlying Market Price': market_price,
+                    'Underlying Cost Basis': cost_basis_price,
+                    'Underlying Price Source': underlying_price_source.get(symbol, 'unknown'),
+                    'Notional Position Value (NPV)': total_notional
+                })
+                total_npv += total_notional
+            except Exception as calc_error:
+                log_debug(f"Error calculating values for {symbol}: {calc_error}", "warning")
+                continue
+
+        source_counts = {}
+        for row in underlying_data:
+            source = row.get('Underlying Price Source', 'unknown')
+            source_counts[source] = source_counts.get(source, 0) + 1
+        if source_counts:
+            log_debug(f"Underlying price sources: {source_counts}", "info", display_ui=False)
+            fallback_symbols = [
+                row.get('Symbol')
+                for row in underlying_data
+                if row.get('Underlying Price Source') in ('cost_basis', 'unavailable')
+            ]
+            if fallback_symbols:
+                log_debug(f"Fallback-priced symbols: {fallback_symbols}", "info", display_ui=False)
+
+        underlying_df = pd.DataFrame(underlying_data)
+        log_debug(f"Created dataframe with {len(underlying_df)} rows", "info")
+
+        log_debug("Calculating metrics...", "info")
+        nlv = get_account_value(account_df, 'NetLiquidation', numeric=True, default=0.0)
+        gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
+        if not is_valid_number(total_npv):
+            total_npv = 0.0
+
+        notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
+        standard_leverage_ratio = gross_pos_val / nlv if nlv > 0 else 0
+
+        account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = format_currency(total_npv)
+        account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
+        account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
+
+        log_debug("Metrics calculated successfully", "info")
+        log_debug(f"Portfolio data retrieval complete in {time.time() - started_at:.2f}s", "info")
+        return account_df, underlying_df, positions_by_underlying
+
+    except Exception as e:
+        log_debug(f"Error in portfolio data retrieval: {str(e)}", "error")
+        log_debug(traceback.format_exc(), "error", display_ui=False)
+        return None, None, None
 
 # Async wrapper for option chain data
 async def async_get_option_chain(ib, ticker):
@@ -820,7 +1480,7 @@ def get_portfolio_data():
     if not ib.isConnected():
         return None, None, None
     try:
-        return run_async(async_get_portfolio_data(ib))
+        return get_portfolio_data_sync(ib)
     except Exception as e:
         st.error(f"Error getting portfolio data: {e}")
         return None, None, None
@@ -883,6 +1543,14 @@ if auto_refresh:
     refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 5, 60, 10)
     time.sleep(refresh_interval)
     st.rerun()
+
+if st.sidebar.button("Clear Quote Cache"):
+    runtime_cache = get_runtime_cache()
+    runtime_cache['underlying_prices'].clear()
+    runtime_cache['option_deltas'].clear()
+    st.session_state.pop('underlying_price_cache', None)
+    st.session_state.pop('option_delta_cache', None)
+    st.sidebar.success("Cleared quote cache.")
 # Diagnostics section
 st.sidebar.markdown("---")
 st.sidebar.title("Diagnostics")
@@ -973,6 +1641,12 @@ def main():
             connection_success = False
     else:
         connection_success = True
+
+    # Refresh sidebar indicator after connection logic runs in this same rerun.
+    if ib.isConnected():
+        connection_status.success("Connected to TWS")
+    else:
+        connection_status.error("Not connected to TWS")
     
     if connection_success:
         # Update portfolio data directly (no background threads)
@@ -1016,17 +1690,52 @@ def main():
                 with main_content:
                     try:
                         st.subheader("Positions by Underlying")
-                        # Format monetary values
+                        # Keep numeric dtypes for correct sorting; format via column_config.
                         display_df = underlying_df.copy()
-                        for col in ['Stock Value', 'Option Notional Value', 'Option Actual Value', 'Notional Position Value (NPV)']:
+                        numeric_cols = [
+                            'Stock Count',
+                            'Stock Value',
+                            'Option Notional (Shares)',
+                            'Option Notional Value',
+                            'Option Actual Value',
+                            'Underlying Market Price',
+                            'Underlying Cost Basis',
+                            'Underlying Price',
+                            'Notional Position Value (NPV)',
+                        ]
+                        for col in numeric_cols:
                             if col in display_df.columns:
-                                display_df[col] = display_df[col].apply(format_currency)
-                        
-                        # Format underlying price
-                        if 'Underlying Price' in display_df.columns:
-                            display_df['Underlying Price'] = display_df['Underlying Price'].apply(lambda x: f"${x:.2f}")
-                        
-                        st.dataframe(display_df, use_container_width=True)
+                                display_df[col] = pd.to_numeric(display_df[col], errors='coerce')
+
+                        column_config = {}
+                        currency_cols = [
+                            'Stock Value',
+                            'Option Notional Value',
+                            'Option Actual Value',
+                            'Underlying Market Price',
+                            'Underlying Cost Basis',
+                            'Underlying Price',
+                            'Notional Position Value (NPV)',
+                        ]
+                        for col in currency_cols:
+                            if col in display_df.columns:
+                                column_config[col] = st.column_config.NumberColumn(
+                                    col,
+                                    format="$%.2f",
+                                )
+
+                        if 'Option Notional (Shares)' in display_df.columns:
+                            column_config['Option Notional (Shares)'] = st.column_config.NumberColumn(
+                                'Option Notional (Shares)',
+                                format="%.2f",
+                            )
+                        if 'Stock Count' in display_df.columns:
+                            column_config['Stock Count'] = st.column_config.NumberColumn(
+                                'Stock Count',
+                                format="%.4f",
+                            )
+
+                        st.dataframe(display_df, use_container_width=True, column_config=column_config)
                         
                         # Show last update time
                         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
