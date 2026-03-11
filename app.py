@@ -11,15 +11,11 @@ st.set_page_config(
 import pandas as pd
 import numpy as np
 import time
-import threading
 import asyncio
 from datetime import datetime
 import locale
 import random
 
-"""
-Debug helper functions for Interactive Brokers API integration
-"""
 import logging
 import traceback
 import sys
@@ -37,144 +33,37 @@ logging.basicConfig(
 
 logger = logging.getLogger("ib_app")
 
-# Dictionary to store debug state
-debug_state = {
-    'last_operation': None,
-    'last_error': None,
-    'connection_attempts': 0,
-    'api_timings': {},
-    'account_data_received': False,
-    'positions_received': False,
-    'last_update_time': None
-}
-
 def log_debug(message, level="info", display_ui=True, ui_container=None):
-    """
-    Log a debug message to both the log file and optionally the UI
-    
-    Args:
-        message: The message to log
-        level: Log level (debug, info, warning, error, critical)
-        display_ui: Whether to display in the UI
-        ui_container: Streamlit container to write to (if None, uses st.sidebar)
-    """
-    # Log to file/console
-    log_func = getattr(logger, level.lower())
+    """Compatibility shim while migrating to direct logger usage."""
+    del display_ui, ui_container
+    log_func = getattr(logger, level.lower(), logger.info)
     log_func(message)
-    
-    # Update debug state
-    debug_state['last_operation'] = message
-    debug_state['last_update_time'] = datetime.now()
-    
-    # Display in UI if requested
-    if display_ui and 'st' in globals():
-        container = ui_container if ui_container else st.sidebar
-        
-        if level.lower() == "error":
-            container.error(message)
-            debug_state['last_error'] = message
-        elif level.lower() == "warning":
-            container.warning(message)
-        else:
-            container.info(message)
 
 def time_operation(operation_name):
-    """
-    Decorator to time API operations and log the results
-    """
+    """Decorator to time operations and log start/end/error."""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
             start_time = time.time()
-            log_debug(f"Starting {operation_name}...", "info")
+            logger.info("Starting %s...", operation_name)
             
             try:
                 result = func(*args, **kwargs)
                 
                 end_time = time.time()
                 duration = end_time - start_time
-                debug_state['api_timings'][operation_name] = {
-                    'last_duration': duration,
-                    'last_success': True,
-                    'timestamp': datetime.now()
-                }
-                
-                log_debug(f"Completed {operation_name} in {duration:.2f}s", "info")
+                logger.info("Completed %s in %.2fs", operation_name, duration)
                 return result
                 
             except Exception as e:
                 end_time = time.time()
                 duration = end_time - start_time
-                debug_state['api_timings'][operation_name] = {
-                    'last_duration': duration,
-                    'last_success': False,
-                    'timestamp': datetime.now(),
-                    'error': str(e)
-                }
-                
-                log_debug(f"Error in {operation_name} after {duration:.2f}s: {str(e)}", "error")
-                log_debug(traceback.format_exc(), "error", display_ui=False)
+                logger.error("Error in %s after %.2fs: %s", operation_name, duration, e)
+                logger.error(traceback.format_exc())
                 raise
         
         return wrapper
     return decorator
-
-async def timeout_async(coro, timeout=10.0, operation_name="async operation"):
-    """
-    Run an async coroutine with a timeout
-    """
-    try:
-        log_debug(f"Starting async {operation_name} with {timeout}s timeout", "info")
-        # Create a task for the coroutine
-        task = asyncio.create_task(coro)
-        
-        # Wait for the task to complete with a timeout
-        result = await asyncio.wait_for(task, timeout=timeout)
-        log_debug(f"Async {operation_name} completed successfully", "info")
-        return result
-    except asyncio.TimeoutError:
-        log_debug(f"Timeout occurred in {operation_name} after {timeout}s", "error")
-        raise
-    except Exception as e:
-        log_debug(f"Exception in {operation_name}: {str(e)}", "error")
-        log_debug(traceback.format_exc(), "error", display_ui=False)
-        raise
-
-def display_debug_panel():
-    """
-    Display a debug panel in the Streamlit sidebar
-    """
-    with st.sidebar.expander("Debug Information", expanded=False):
-        st.write("### Connection Status")
-        if ib.isConnected():
-            st.success(f"Connected to TWS (Client ID: {ib.client.clientId})")
-        else:
-            st.error("Not connected to TWS")
-            
-        st.write("### Last Operations")
-        st.text(f"Last operation: {debug_state['last_operation']}")
-        if debug_state['last_error']:
-            st.error(f"Last error: {debug_state['last_error']}")
-            
-        st.write("### Account Data Status")
-        st.text(f"Account data received: {debug_state['account_data_received']}")
-        st.text(f"Positions received: {debug_state['positions_received']}")
-        
-        st.write("### API Timing Information")
-        for op_name, timing in debug_state['api_timings'].items():
-            status = "✅" if timing['last_success'] else "❌"
-            st.text(f"{op_name}: {status} {timing['last_duration']:.2f}s")
-            st.text(f"  Time: {timing['timestamp'].strftime('%H:%M:%S')}")
-            if not timing['last_success'] and 'error' in timing:
-                st.text(f"  Error: {timing['error']}")
-                
-        st.write("### Debug Controls")
-        if st.button("Force Reconnect"):
-            # Use thread-safe way to request reconnection
-            st.session_state.force_reconnect = True
-"""
-END: Debug helper functions for Interactive Brokers API integration
-"""
 
 # Set the event loop policy first
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
@@ -193,7 +82,7 @@ def safe_float_conversion(value_str):
             value = float(clean_str)
             return value if np.isfinite(value) else 0.0
         except ValueError:
-            st.sidebar.warning(f"Could not convert '{value_str}' to float")
+            logger.warning("Could not convert %r to float", value_str)
             return 0.0
     
     # Already a number
@@ -471,111 +360,63 @@ ib = get_ib()
 # Connect to IB TWS
 @time_operation("IB Connection")
 def connect_to_ib():
-    """Connect to Interactive Brokers TWS API with extensive debugging"""
-    debug_container = st.sidebar.empty()
-    log_debug("Starting connection to Interactive Brokers", ui_container=debug_container)
-    
-    debug_state['connection_attempts'] += 1
-    
-    if not ib.isConnected():
+    """Connect to Interactive Brokers TWS API."""
+    logger.info("Starting connection to Interactive Brokers")
+
+    if ib.isConnected():
+        logger.info("Already connected to TWS")
+        return True
+
+    try:
+        client_id = random.randint(1000, 9999)
+        logger.info("Attempting connection with client ID: %s", client_id)
+
         try:
-            # Use a random client ID to avoid conflicts
-            client_id = random.randint(1000, 9999)
-            log_debug(f"Attempting connection with client ID: {client_id}", ui_container=debug_container)
-            
-            # Try to disconnect first in case of lingering connections
-            try:
-                log_debug("Disconnecting any existing connections", ui_container=debug_container)
-                ib.disconnect()
-                log_debug("Disconnect successful", ui_container=debug_container)
-            except Exception as disconnect_error:
-                log_debug(f"Disconnect error (non-critical): {disconnect_error}", "warning", ui_container=debug_container)
-            
-            # Clear cached data
-            log_debug("Clearing any cached data", ui_container=debug_container)
-            debug_state['account_data_received'] = False
-            debug_state['positions_received'] = False
-            
-            # Connect with timeout handling
-            connect_timeout = 10  # seconds
-            log_debug(f"Attempting connection to 127.0.0.1:7497 with {connect_timeout}s timeout", ui_container=debug_container)
-            
-            # The connection itself (non-async)
-            connection_start = time.time()
-            try:
-                ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=connect_timeout)
-                connection_duration = time.time() - connection_start
-                log_debug(f"Connection established in {connection_duration:.2f}s", ui_container=debug_container)
-                try:
-                    # Use delayed-frozen market data when live subscriptions are unavailable.
-                    ib.reqMarketDataType(4)
-                    log_debug("Market data type set to delayed-frozen (4)", ui_container=debug_container)
-                except Exception as market_data_type_error:
-                    log_debug(f"Could not set delayed market data type: {market_data_type_error}", "warning", ui_container=debug_container)
-            except Exception as connect_error:
-                log_debug(f"Connection failed: {connect_error}", "error", ui_container=debug_container)
-                log_debug(traceback.format_exc(), "error", display_ui=False)
-                return False
-            
-            # Connection succeeded, now check account data
-            st.success("Connected to Interactive Brokers")
-            
-            # Add diagnostic information
-            log_debug("Checking account data availability...", ui_container=debug_container)
-            
-            # Test if we can get account info
-            try:
-                log_debug("Requesting account summary data...", ui_container=debug_container)
-                account_values = ib.accountSummary()
+            ib.disconnect()
+        except Exception as disconnect_error:
+            logger.warning("Disconnect before reconnect failed (non-critical): %s", disconnect_error)
 
-                if account_values:
-                    debug_state['account_data_received'] = True
-                    log_debug(f"Successfully retrieved {len(account_values)} account values", "info", ui_container=debug_container)
+        connect_timeout = 10
+        logger.info("Attempting connection to 127.0.0.1:7497 with %ss timeout", connect_timeout)
 
-                    # Display a sample of key values for diagnostics
-                    account_sample = [val for val in account_values if val.tag in ['NetLiquidation', 'GrossPositionValue', 'TotalCashValue']]
-                    if account_sample:
-                        sample_text = ""
-                        for val in account_sample:
-                            sample_text += f"{val.tag}: {val.value}\n"
-                        log_debug(f"Account sample:\n{sample_text}", ui_container=debug_container)
-                    else:
-                        log_debug("No sample account values found in expected categories", "warning", ui_container=debug_container)
-                else:
-                    log_debug("Account data returned empty. Check permissions in IB Gateway.", "warning", ui_container=debug_container)
-            except Exception as e:
-                log_debug(f"Error retrieving account data: {e}", "error", ui_container=debug_container)
-                log_debug(traceback.format_exc(), "error", display_ui=False)
-                # Continue anyway - we might still be able to get positions
+        connection_start = time.time()
+        ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=connect_timeout)
+        logger.info("Connection established in %.2fs", time.time() - connection_start)
 
-            # Test if we can get positions
-            try:
-                log_debug("Requesting position data...", ui_container=debug_container)
-                positions = ib.positions()
+        try:
+            ib.reqMarketDataType(4)
+            logger.info("Market data type set to delayed-frozen (4)")
+        except Exception as market_data_type_error:
+            logger.warning("Could not set delayed market data type: %s", market_data_type_error)
 
-                if positions:
-                    debug_state['positions_received'] = True
-                    log_debug(f"Successfully retrieved {len(positions)} positions", ui_container=debug_container)
+        st.success("Connected to Interactive Brokers")
 
-                    # Show a sample position for diagnostics
-                    if len(positions) > 0:
-                        pos = positions[0]
-                        log_debug(f"Example position: {pos.contract.symbol}, {pos.position} @ {pos.avgCost}", ui_container=debug_container)
-                else:
-                    log_debug("No positions found. If you expect positions, check IB Gateway permissions.", "warning", ui_container=debug_container)
-            except Exception as e:
-                log_debug(f"Error retrieving positions: {e}", "error", ui_container=debug_container)
-                log_debug(traceback.format_exc(), "error", display_ui=False)
-            
-            log_debug("Connection process completed", ui_container=debug_container)
-            return True
-        except Exception as e:
-            log_debug(f"Unhandled exception during connection: {e}", "error", ui_container=debug_container)
-            log_debug(traceback.format_exc(), "error", display_ui=False)
-            return False
-    
-    log_debug("Already connected to TWS", ui_container=debug_container)
-    return True
+        try:
+            account_values = ib.accountSummary()
+            if account_values:
+                logger.info("Retrieved %s account summary values", len(account_values))
+            else:
+                logger.warning("Account summary returned empty")
+        except Exception as account_error:
+            logger.error("Error retrieving account summary: %s", account_error)
+            logger.error(traceback.format_exc())
+
+        try:
+            positions = ib.positions()
+            if positions:
+                logger.info("Retrieved %s positions", len(positions))
+            else:
+                logger.warning("Positions returned empty")
+        except Exception as positions_error:
+            logger.error("Error retrieving positions: %s", positions_error)
+            logger.error(traceback.format_exc())
+
+        logger.info("Connection process completed")
+        return True
+    except Exception as connect_error:
+        logger.error("Unhandled exception during connection: %s", connect_error)
+        logger.error(traceback.format_exc())
+        return False
 
 # Function to safely run async code
 def run_async(coro):
@@ -642,7 +483,6 @@ async def async_get_portfolio_data(ib):
             account_df = account_df.set_index('Tag')
             
             # Update debug state
-            debug_state['account_data_received'] = True
             
         except asyncio.TimeoutError:
             log_debug("Timeout occurred while waiting for account data (20s)", "error")
@@ -663,7 +503,6 @@ async def async_get_portfolio_data(ib):
                 log_debug("No positions found", "warning")
             else:
                 log_debug(f"Got {len(positions)} positions", "info")
-                debug_state['positions_received'] = True
             
         except asyncio.TimeoutError:
             log_debug("Timeout occurred while waiting for position data (20s)", "error")
@@ -908,7 +747,6 @@ def get_portfolio_data_sync(ib):
 
         account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], columns=['Tag', 'Value'])
         account_df = account_df.set_index('Tag')
-        debug_state['account_data_received'] = True
 
         log_debug("Fetching positions...", "info")
         t0 = time.time()
@@ -916,7 +754,6 @@ def get_portfolio_data_sync(ib):
         log_debug(f"Fetched positions in {time.time() - t0:.2f}s", "debug", display_ui=False)
         if positions:
             log_debug(f"Got {len(positions)} positions", "info")
-            debug_state['positions_received'] = True
         else:
             log_debug("No positions found", "warning")
 
@@ -1551,63 +1388,6 @@ if st.sidebar.button("Clear Quote Cache"):
     st.session_state.pop('underlying_price_cache', None)
     st.session_state.pop('option_delta_cache', None)
     st.sidebar.success("Cleared quote cache.")
-# Diagnostics section
-st.sidebar.markdown("---")
-st.sidebar.title("Diagnostics")
-if st.sidebar.button("Test API Data Access"):
-    with st.sidebar.expander("API Test Results", expanded=True):
-        st.write("Testing IB API connection...")
-        
-        if not ib.isConnected():
-            st.error("Not connected to IB Gateway")
-        else:
-            st.success("Connected to IB Gateway")
-            
-            # Test account data
-            try:
-                st.write("Requesting account data...")
-                account_values = ib.accountSummary()
-                st.write(f"Received {len(account_values)} account values")
-                
-                # Display sample
-                if account_values:
-                    df = pd.DataFrame([(val.tag, val.value) for val in account_values[:10]], 
-                                      columns=['Tag', 'Value'])
-                    st.dataframe(df)
-                else:
-                    st.warning("No account data received")
-            except Exception as e:
-                st.error(f"Error getting account data: {e}")
-                
-            # Test positions
-            try:
-                st.write("Requesting positions...")
-                positions = ib.positions()
-                st.write(f"Received {len(positions)} positions")
-                
-                # Display sample
-                if positions:
-                    pos_data = []
-                    for pos in positions[:5]:  # Show first 5 positions
-                        pos_data.append({
-                            'Symbol': pos.contract.symbol,
-                            'SecType': pos.contract.secType,
-                            'Position': pos.position,
-                            'Avg Cost': pos.avgCost
-                        })
-                    st.dataframe(pd.DataFrame(pos_data))
-                else:
-                    st.warning("No positions received")
-            except Exception as e:
-                st.error(f"Error getting positions: {e}")
-
-if st.sidebar.button("Direct Portfolio Fetch"):
-    st.sidebar.info("Directly fetching portfolio data (bypassing threading)...")
-    
-# Remove obsolete threading functions - Streamlit doesn't work with background threads
-
-
-# Remove obsolete background update functions - they don't work with Streamlit
 
 # Streamlit-compatible main execution
 def main():
@@ -1615,20 +1395,6 @@ def main():
     setup_asyncio_event_loop()
     
     log_debug("Starting application", "info")
-    
-    # Add debug panel to sidebar
-    display_debug_panel()
-    
-    # Check for force reconnect from debug panel
-    if 'force_reconnect' in st.session_state and st.session_state.force_reconnect:
-        log_debug("Force reconnect requested from debug panel", "info")
-        if ib.isConnected():
-            try:
-                ib.disconnect()
-                log_debug("Disconnected for force reconnect", "info")
-            except Exception as disconnect_error:
-                log_debug(f"Error during disconnect for force reconnect: {disconnect_error}", "warning")
-        st.session_state.force_reconnect = False
     
     # Try to connect if not already connected
     if not ib.isConnected():
@@ -1800,97 +1566,6 @@ def main():
     else:
         st.error("Failed to connect to Interactive Brokers. Please make sure TWS or IB Gateway is running.")
 
-# Add a new advanced debug section at the end of the app
-def add_advanced_debug_section():
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("Advanced Debugging", expanded=False):
-        st.subheader("Connection Testing")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Test TWS Connection"):
-                log_debug("Manual connection test initiated", "info")
-                if connect_to_ib():
-                    st.success("Connection test successful")
-                else:
-                    st.error("Connection test failed")
-        
-        with col2:
-            if st.button("Direct Account Data Test"):
-                log_debug("Direct account data test initiated", "info")
-                if not ib.isConnected():
-                    st.error("Not connected to TWS")
-                else:
-                    try:
-                        account_values = ib.accountSummary()
-                        if account_values:
-                            st.success(f"Received {len(account_values)} account values directly")
-                            # Show first few items
-                            for i, val in enumerate(account_values[:5]):
-                                st.text(f"{val.tag}: {val.value}")
-                        else:
-                            st.warning("No account data received in direct test")
-                    except Exception as e:
-                        st.error(f"Error in direct account test: {e}")
-        
-        st.subheader("Connection Diagnostics")
-        
-        if st.button("Run Diagnostics"):
-            log_debug("Running connection diagnostics", "info")
-            diagnostics = {}
-            
-            # Check if TWS is running
-            try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1)
-                result = s.connect_ex(('127.0.0.1', 7497))
-                s.close()
-                
-                if result == 0:
-                    diagnostics["TWS Port"] = "Open (7497)"
-                else:
-                    diagnostics["TWS Port"] = "Closed or blocked"
-            except Exception as e:
-                diagnostics["TWS Port Check Error"] = str(e)
-            
-            # Check API settings if connected
-            if ib.isConnected():
-                diagnostics["API Connection"] = "Active"
-                diagnostics["Client ID"] = ib.client.clientId
-                diagnostics["Server Version"] = ib.client.serverVersion()
-                
-                # Try to get managed accounts
-                try:
-                    accounts = ib.client.getAccounts()
-                    diagnostics["Available Accounts"] = accounts
-                except Exception as e:
-                    diagnostics["Account Error"] = str(e)
-                
-                # Check if we can do a basic API call
-                try:
-                    time_now = ib.reqCurrentTime()
-                    diagnostics["Server Time"] = str(time_now)
-                except Exception as e:
-                    diagnostics["Time Request Error"] = str(e)
-            else:
-                diagnostics["API Connection"] = "Inactive"
-            
-            st.json(diagnostics)
-        
-        # Add log level control
-        st.subheader("Logging Level")
-        log_level = st.selectbox(
-            "Set Logging Level",
-            ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-            index=1  # Default to INFO
-        )
-        
-        if st.button("Apply Log Level"):
-            logger.setLevel(getattr(logging, log_level))
-            st.success(f"Logging level set to {log_level}")
-            log_debug(f"Logging level changed to {log_level}", "info")
-
 # Main execution - simplified for Streamlit
 if __name__ == "__main__":
     # Ensure event loop is set up
@@ -1905,9 +1580,6 @@ if __name__ == "__main__":
     # Manual refresh button
     if st.sidebar.button("Refresh Data"):
         st.rerun()
-    
-    # Add advanced debug section
-    add_advanced_debug_section()
     
     # Run the main function
     main()
