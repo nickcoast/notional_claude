@@ -20,6 +20,7 @@ import logging
 import traceback
 import sys
 from functools import wraps
+from collections import deque
 
 # Configure logging to write to both console and a file
 logging.basicConfig(
@@ -61,6 +62,39 @@ def time_operation(operation_name):
 
 # Set the event loop policy first
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
+PREFERRED_MARKET_DATA_TYPE = 3
+CACHEABLE_UNDERLYING_SOURCES = {
+    "portfolio",
+    "portfolio_derived",
+    "portfolio_value",
+    "option_greeks",
+    "snapshot",
+    "snapshot_retry",
+    "stream_retry",
+}
+HIGH_CONFIDENCE_UNDERLYING_SOURCES = {
+    "portfolio",
+    "portfolio_derived",
+    "portfolio_value",
+    "option_greeks",
+}
+RETRYABLE_UNDERLYING_SOURCES = {"unavailable", "snapshot", "snapshot_retry"}
+QUOTE_RETRY_MAX_ATTEMPTS = 6
+QUOTE_RETRY_COOLDOWN_SECONDS = 8
+QUOTE_RETRY_BATCH_SIZE = 6
+IB_CONNECTION_ERROR_CODES = {502, 504, 1100, 1101, 1102, 1300, 2110}
+IB_FARM_WARNING_CODES = {2103, 2104, 2105, 2106, 2157, 2158}
+IB_QUOTE_ERROR_CODES = {354}
+
+
+def parse_ib_farm_from_error(error_message):
+    """Extract farm identifier from IB warning strings like '...:usopt'."""
+    if not isinstance(error_message, str):
+        return None
+    if ":" not in error_message:
+        return None
+    return error_message.rsplit(":", 1)[-1].strip() or None
 
 def safe_float_conversion(value_str):
     """Safely convert a string to float, handling various formats"""
@@ -281,6 +315,24 @@ def gather_stock_market_data(ib, contracts, wait_seconds=0.5, chunk_size=12):
 
     return ticker_by_symbol
 
+
+def gather_stock_snapshot_data(ib, contracts, timeout_seconds=2.0, chunk_size=6):
+    """Request stock snapshot data via reqTickers with bounded timeout/chunking."""
+    ticker_by_symbol = {}
+    tickers = bounded_req_tickers(
+        ib,
+        contracts,
+        timeout_seconds=timeout_seconds,
+        chunk_size=chunk_size,
+        label="stock snapshot",
+    )
+    for ticker in tickers:
+        contract = getattr(ticker, "contract", None)
+        symbol = getattr(contract, "symbol", None)
+        if symbol:
+            ticker_by_symbol[symbol] = ticker
+    return ticker_by_symbol
+
 # Define the helper function for other threads
 def setup_asyncio_event_loop():
     """Ensure there is an event loop available for the current thread"""
@@ -347,9 +399,84 @@ def get_runtime_cache():
     return {
         'underlying_prices': {},
         'option_deltas': {},
+        'quote_retry_state': {},
     }
 
 ib = get_ib()
+
+
+@st.cache_resource
+def get_ib_diagnostics_state():
+    """Process-lifetime IB diagnostics captured from API error callbacks."""
+    return {
+        'events': deque(maxlen=500),
+        'farm_status': {},
+    }
+
+
+def register_ib_error_handler():
+    """Register a single IB error-event handler for diagnostics."""
+    diagnostics_state = get_ib_diagnostics_state()
+    if diagnostics_state.get('registered'):
+        return
+
+    def handle_ib_error(req_id, error_code, error_message, contract):
+        now_ts = time.time()
+        symbol = getattr(contract, 'symbol', None) if contract else None
+        diagnostics_state['events'].append({
+            'ts': now_ts,
+            'req_id': req_id,
+            'code': int(error_code),
+            'message': error_message,
+            'symbol': symbol,
+        })
+
+        if int(error_code) in IB_FARM_WARNING_CODES:
+            farm = parse_ib_farm_from_error(error_message)
+            if farm:
+                diagnostics_state['farm_status'][farm] = {
+                    'code': int(error_code),
+                    'message': error_message,
+                    'ts': now_ts,
+                }
+
+    ib.errorEvent += handle_ib_error
+    diagnostics_state['registered'] = True
+
+
+def get_recent_ib_events(since_ts):
+    diagnostics_state = get_ib_diagnostics_state()
+    return [event for event in diagnostics_state['events'] if event.get('ts', 0) >= since_ts]
+
+
+def render_connection_diagnostics():
+    """Render sidebar diagnostics that distinguish session vs quote issues."""
+    health = st.session_state.get('last_data_health')
+    if not health:
+        diagnostic_status.info("Diagnostics: waiting for portfolio fetch.")
+        diagnostic_detail.empty()
+        return
+
+    if not health.get('connection_ok', False):
+        note = health.get('note') or "Could not establish/maintain IB API session."
+        diagnostic_status.error(f"Diagnostics: {note}")
+        diagnostic_detail.empty()
+        return
+
+    quote_issue_count = int(health.get('quote_issue_count', 0))
+    farm_down_count = int(health.get('farm_down_count', 0))
+    if quote_issue_count > 0 or farm_down_count > 0:
+        diagnostic_status.warning(
+            f"Diagnostics: connected, but quote retrieval degraded (quote issues: {quote_issue_count}, farms down: {farm_down_count})."
+        )
+        farm_names = health.get('farm_down_names') or []
+        if farm_names:
+            diagnostic_detail.caption(f"Degraded farms: {', '.join(farm_names[:5])}")
+        else:
+            diagnostic_detail.empty()
+    else:
+        diagnostic_status.success("Diagnostics: connected and quote retrieval healthy.")
+        diagnostic_detail.empty()
 
 # Connect to IB TWS
 @time_operation("IB Connection")
@@ -378,10 +505,10 @@ def connect_to_ib():
         logger.info("Connection established in %.2fs", time.time() - connection_start)
 
         try:
-            ib.reqMarketDataType(4)
-            logger.info("Market data type set to delayed-frozen (4)")
+            ib.reqMarketDataType(PREFERRED_MARKET_DATA_TYPE)
+            logger.info("Market data type set to %s", PREFERRED_MARKET_DATA_TYPE)
         except Exception as market_data_type_error:
-            logger.warning("Could not set delayed market data type: %s", market_data_type_error)
+            logger.warning("Could not set preferred market data type: %s", market_data_type_error)
 
         st.success("Connected to Interactive Brokers")
 
@@ -455,9 +582,9 @@ async def async_get_portfolio_data(ib):
         # Debug info
         logger.info("Starting portfolio data retrieval")
         try:
-            ib.reqMarketDataType(4)
+            ib.reqMarketDataType(PREFERRED_MARKET_DATA_TYPE)
         except Exception as market_data_type_error:
-            logger.warning(f"Unable to set delayed-frozen market data type: {market_data_type_error}")
+            logger.warning(f"Unable to set market data type {PREFERRED_MARKET_DATA_TYPE}: {market_data_type_error}")
         
         # Get account summary with timeout
         logger.info("Fetching account data...")
@@ -726,10 +853,20 @@ def get_portfolio_data_sync(ib):
     logger.info("Starting portfolio data retrieval")
     try:
         started_at = time.time()
+        st.session_state['last_data_health'] = {
+            'as_of': started_at,
+            'connection_ok': bool(ib.isConnected()),
+            'connection_issue_count': 0,
+            'quote_issue_count': 0,
+            'farm_down_count': 0,
+            'farm_down_names': [],
+            'quote_issue_symbols': [],
+            'fallback_symbols': [],
+        }
         try:
-            ib.reqMarketDataType(4)
+            ib.reqMarketDataType(PREFERRED_MARKET_DATA_TYPE)
         except Exception as market_data_type_error:
-            logger.warning(f"Unable to set delayed-frozen market data type: {market_data_type_error}")
+            logger.warning(f"Unable to set market data type {PREFERRED_MARKET_DATA_TYPE}: {market_data_type_error}")
 
         logger.info("Fetching account data...")
         t0 = time.time()
@@ -737,6 +874,17 @@ def get_portfolio_data_sync(ib):
         logger.debug(f"Fetched account data in {time.time() - t0:.2f}s")
         if not account_summary:
             logger.warning("Account summary is empty")
+            st.session_state['last_data_health'] = {
+                'as_of': time.time(),
+                'connection_ok': False,
+                'connection_issue_count': 1,
+                'quote_issue_count': 0,
+                'farm_down_count': 0,
+                'farm_down_names': [],
+                'quote_issue_symbols': [],
+                'fallback_symbols': [],
+                'note': 'Empty account summary from IB API',
+            }
             return None, None, None
 
         account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], columns=['Tag', 'Value'])
@@ -767,6 +915,7 @@ def get_portfolio_data_sync(ib):
         runtime_cache = get_runtime_cache()
         persistent_underlying_price_cache = runtime_cache['underlying_prices']
         persistent_option_delta_cache = runtime_cache['option_deltas']
+        quote_retry_state = runtime_cache['quote_retry_state']
         cache_ttl_seconds = 180
         now_ts = time.time()
 
@@ -843,7 +992,9 @@ def get_portfolio_data_sync(ib):
                 'ts': time.time(),
             }
 
-        def cache_underlying_price(symbol, price_value):
+        def cache_underlying_price(symbol, price_value, source=None):
+            if source not in CACHEABLE_UNDERLYING_SOURCES:
+                return
             if not is_valid_number(price_value) or float(price_value) <= 0:
                 return
             numeric_price = float(price_value)
@@ -857,6 +1008,9 @@ def get_portfolio_data_sync(ib):
         option_contracts = []
         seen_option_keys = set()
         underlying_symbols = sorted({pos.contract.symbol for pos in positions if pos.contract.symbol})
+        for symbol in list(quote_retry_state.keys()):
+            if symbol not in underlying_symbols:
+                del quote_retry_state[symbol]
         for pos in positions:
             contract = pos.contract
             if contract.secType != 'OPT':
@@ -882,6 +1036,9 @@ def get_portfolio_data_sync(ib):
         # Pull option deltas/quotes and feed underlying prices from option greeks.
         option_delta_map = {}
         option_price_map = {}
+        option_keys_with_delta = set()
+        option_keys_with_und_price = set()
+        option_keys_with_price = set()
 
         def absorb_option_tickers(option_tickers):
             for key, ticker in option_tickers.items():
@@ -889,25 +1046,31 @@ def get_portfolio_data_sync(ib):
                 if is_valid_number(delta):
                     option_delta_map[key] = float(delta)
                     cache_option_delta(key, delta)
+                    option_keys_with_delta.add(key)
 
                 option_price = pick_price_from_ticker(ticker)
                 if option_price is not None:
                     option_price_map[key] = option_price
+                    option_keys_with_price.add(key)
 
                 underlying_symbol = key[0]
                 und_price = option_underlying_price_from_ticker(ticker)
-                if und_price is not None and underlying_symbol not in underlying_market_price_map:
-                    underlying_market_price_map[underlying_symbol] = und_price
-                    underlying_price_source[underlying_symbol] = "option_greeks"
-                    cache_underlying_price(underlying_symbol, und_price)
+                if und_price is not None:
+                    option_keys_with_und_price.add(key)
+                    if underlying_symbol not in underlying_market_price_map:
+                        underlying_market_price_map[underlying_symbol] = und_price
+                        underlying_price_source[underlying_symbol] = "option_greeks"
+                        cache_underlying_price(underlying_symbol, und_price, source="option_greeks")
 
-        def fetch_missing_underlyings(wait_seconds, chunk_size, label):
-            missing_underlyings = [s for s in underlying_symbols if s not in underlying_market_price_map]
-            if not missing_underlyings:
+        def fetch_underlyings(symbols, wait_seconds, chunk_size, label, source_tag, only_missing=True):
+            target_symbols = [s for s in symbols if s]
+            if only_missing:
+                target_symbols = [s for s in target_symbols if s not in underlying_market_price_map]
+            if not target_symbols:
                 return
 
             t0 = time.time()
-            stock_contracts = [Stock(symbol, 'SMART', 'USD') for symbol in missing_underlyings]
+            stock_contracts = [Stock(symbol, 'SMART', 'USD') for symbol in target_symbols]
             stock_tickers = gather_stock_market_data(
                 ib,
                 stock_contracts,
@@ -918,12 +1081,62 @@ def get_portfolio_data_sync(ib):
                 f"{label}: requested {len(stock_contracts)} underlying streams in {time.time() - t0:.2f}s"
             )
 
+            stream_resolved = set()
             for symbol, ticker in stock_tickers.items():
                 price = pick_price_from_ticker(ticker)
                 if price is not None:
+                    existing_source = underlying_price_source.get(symbol)
+                    if existing_source in HIGH_CONFIDENCE_UNDERLYING_SOURCES:
+                        stream_resolved.add(symbol)
+                        continue
                     underlying_market_price_map[symbol] = price
-                    underlying_price_source[symbol] = "snapshot"
-                    cache_underlying_price(symbol, price)
+                    underlying_price_source[symbol] = source_tag
+                    cache_underlying_price(symbol, price, source=source_tag)
+                    stream_resolved.add(symbol)
+
+            if only_missing:
+                snapshot_targets = [s for s in target_symbols if s not in underlying_market_price_map]
+            else:
+                snapshot_targets = [s for s in target_symbols if s not in stream_resolved]
+
+            if snapshot_targets:
+                t0 = time.time()
+                snapshot_contracts = [Stock(symbol, 'SMART', 'USD') for symbol in snapshot_targets]
+                snapshot_tickers = gather_stock_snapshot_data(
+                    ib,
+                    snapshot_contracts,
+                    timeout_seconds=max(2.0, wait_seconds * 3),
+                    chunk_size=max(4, min(chunk_size, 8)),
+                )
+                logger.debug(
+                    f"{label}: requested {len(snapshot_contracts)} underlying snapshots in {time.time() - t0:.2f}s"
+                )
+                for symbol, ticker in snapshot_tickers.items():
+                    price = pick_price_from_ticker(ticker)
+                    if price is not None:
+                        existing_source = underlying_price_source.get(symbol)
+                        if existing_source in HIGH_CONFIDENCE_UNDERLYING_SOURCES:
+                            continue
+                        underlying_market_price_map[symbol] = price
+                        underlying_price_source[symbol] = source_tag
+                        cache_underlying_price(symbol, price, source=source_tag)
+
+            unresolved_symbols = [s for s in target_symbols if s not in underlying_market_price_map]
+            if unresolved_symbols:
+                logger.info(f"{label}: unresolved underlyings after fetch: {unresolved_symbols}")
+
+        due_retry_symbols = []
+        force_retry_now = bool(st.session_state.pop('force_retry_quotes_now', False))
+        auto_retry_enabled = bool(st.session_state.get('auto_retry_quotes_enabled', False))
+        for symbol, state in quote_retry_state.items():
+            attempts = int(safe_float_conversion(state.get('attempts')))
+            next_retry_ts = safe_float_conversion(state.get('next_retry_ts'))
+            if attempts >= QUOTE_RETRY_MAX_ATTEMPTS:
+                continue
+            if force_retry_now or (auto_retry_enabled and now_ts >= next_retry_ts):
+                due_retry_symbols.append((attempts, next_retry_ts, symbol))
+        due_retry_symbols.sort(key=lambda item: (item[0], item[1], item[2]))
+        queued_retry_symbols = [symbol for _, _, symbol in due_retry_symbols[:QUOTE_RETRY_BATCH_SIZE]]
 
         if option_contracts:
             t0 = time.time()
@@ -938,7 +1151,14 @@ def get_portfolio_data_sync(ib):
             )
             absorb_option_tickers(option_tickers)
 
-        fetch_missing_underlyings(wait_seconds=0.5, chunk_size=12, label="Initial fetch")
+        fetch_underlyings(
+            underlying_symbols,
+            wait_seconds=0.5,
+            chunk_size=12,
+            label="Initial fetch",
+            source_tag="snapshot",
+            only_missing=True,
+        )
 
         # If live coverage is poor, do a slower second pass before relying on cache/fallback.
         min_live_quotes = max(5, int(len(underlying_symbols) * 0.5))
@@ -959,7 +1179,52 @@ def get_portfolio_data_sync(ib):
                 )
                 absorb_option_tickers(option_tickers)
 
-            fetch_missing_underlyings(wait_seconds=1.0, chunk_size=8, label="Retry fetch")
+            fetch_underlyings(
+                underlying_symbols,
+                wait_seconds=1.0,
+                chunk_size=8,
+                label="Retry fetch",
+                source_tag="snapshot",
+                only_missing=True,
+            )
+
+        if queued_retry_symbols:
+            queued_retry_symbol_set = set(queued_retry_symbols)
+            retry_option_contracts = [c for c in option_contracts if c.symbol in queued_retry_symbol_set]
+            if retry_option_contracts:
+                t0 = time.time()
+                option_tickers = gather_option_market_data(
+                    ib,
+                    retry_option_contracts,
+                    wait_seconds=1.3,
+                    chunk_size=3,
+                )
+                logger.debug(
+                    f"Queued retry: requested {len(retry_option_contracts)} option streams in {time.time() - t0:.2f}s"
+                )
+                absorb_option_tickers(option_tickers)
+
+            logger.info(f"Retry queue: refreshing underlying quotes for {queued_retry_symbols}")
+            fetch_underlyings(
+                queued_retry_symbols,
+                wait_seconds=1.5,
+                chunk_size=4,
+                label="Queued retry",
+                source_tag="snapshot_retry",
+                only_missing=False,
+            )
+
+        if option_contracts:
+            total_option_contracts = len(option_contracts)
+            logger.info(
+                "Option quote coverage: delta=%s/%s undPrice=%s/%s price=%s/%s",
+                len(option_keys_with_delta),
+                total_option_contracts,
+                len(option_keys_with_und_price),
+                total_option_contracts,
+                len(option_keys_with_price),
+                total_option_contracts,
+            )
 
         for idx, pos in enumerate(positions, start=1):
             try:
@@ -995,18 +1260,25 @@ def get_portfolio_data_sync(ib):
                             if implied_price > 0 and underlying_symbol not in underlying_market_price_map:
                                 underlying_market_price_map[underlying_symbol] = implied_price
                                 underlying_price_source[underlying_symbol] = "portfolio_value"
-                                cache_underlying_price(underlying_symbol, implied_price)
+                                cache_underlying_price(underlying_symbol, implied_price, source="portfolio_value")
 
                     if stock_market_value is None:
                         known_market_price = underlying_market_price_map.get(underlying_symbol)
+                        known_price_from_cache = False
                         if known_market_price is None:
                             known_market_price = underlying_price_cache.get(underlying_symbol)
                             if known_market_price is not None:
                                 underlying_price_source[underlying_symbol] = "cached"
+                                known_price_from_cache = True
                         if is_valid_number(known_market_price) and float(known_market_price) > 0:
                             stock_market_value = float(known_market_price) * pos.position
                             underlying_market_price_map[underlying_symbol] = float(known_market_price)
-                            cache_underlying_price(underlying_symbol, known_market_price)
+                            if not known_price_from_cache:
+                                cache_underlying_price(
+                                    underlying_symbol,
+                                    known_market_price,
+                                    source=underlying_price_source.get(underlying_symbol),
+                                )
 
                     if stock_market_value is None:
                         fallback_cost = safe_float_conversion(pos.avgCost)
@@ -1100,7 +1372,8 @@ def get_portfolio_data_sync(ib):
                     market_price = 0.0
                     underlying_price_source[symbol] = "unavailable"
 
-                cache_underlying_price(symbol, market_price)
+                current_source = underlying_price_source.get(symbol)
+                cache_underlying_price(symbol, market_price, source=current_source)
                 cost_basis_price = 0.0
                 if data['underlying_cost_basis_qty'] > 0:
                     cost_basis_price = data['underlying_cost_basis_sum'] / data['underlying_cost_basis_qty']
@@ -1129,6 +1402,7 @@ def get_portfolio_data_sync(ib):
         for row in underlying_data:
             source = row.get('Underlying Price Source', 'unknown')
             source_counts[source] = source_counts.get(source, 0) + 1
+        fallback_symbols = []
         if source_counts:
             logger.info(f"Underlying price sources: {source_counts}")
             fallback_symbols = [
@@ -1138,6 +1412,96 @@ def get_portfolio_data_sync(ib):
             ]
             if fallback_symbols:
                 logger.info(f"Fallback-priced symbols: {fallback_symbols}")
+
+        recent_ib_events = get_recent_ib_events(started_at - 2.0)
+        connection_events = [e for e in recent_ib_events if e.get('code') in IB_CONNECTION_ERROR_CODES]
+        quote_events = [e for e in recent_ib_events if e.get('code') in IB_QUOTE_ERROR_CODES]
+        farm_down_names = sorted({
+            parse_ib_farm_from_error(e.get('message'))
+            for e in recent_ib_events
+            if e.get('code') in {2103, 2105, 2157}
+            and parse_ib_farm_from_error(e.get('message'))
+        })
+        quote_issue_symbols = sorted({
+            e.get('symbol')
+            for e in quote_events
+            if e.get('symbol')
+        })
+
+        if connection_events:
+            logger.warning(
+                "IB diagnostics: connection-level issues detected in this cycle (%s events)",
+                len(connection_events),
+            )
+        if quote_events:
+            logger.warning(
+                "IB diagnostics: quote entitlement/data issues detected (%s events, symbols=%s)",
+                len(quote_events),
+                quote_issue_symbols or "n/a",
+            )
+        if farm_down_names:
+            logger.warning("IB diagnostics: farms reported degraded/down: %s", farm_down_names)
+
+        st.session_state['last_data_health'] = {
+            'as_of': time.time(),
+            'connection_ok': bool(ib.isConnected()) and not connection_events,
+            'connection_issue_count': len(connection_events),
+            'quote_issue_count': len(quote_events),
+            'farm_down_count': len(farm_down_names),
+            'farm_down_names': farm_down_names,
+            'quote_issue_symbols': quote_issue_symbols,
+            'fallback_symbols': sorted(fallback_symbols),
+        }
+
+        retry_scheduled_symbols = []
+        retry_exhausted_symbols = []
+        retry_now_ts = time.time()
+        for row in underlying_data:
+            symbol = row.get('Symbol')
+            source = row.get('Underlying Price Source', 'unknown')
+            stock_count = safe_float_conversion(row.get('Stock Count'))
+            option_notional_shares = safe_float_conversion(row.get('Option Notional (Shares)'))
+            option_only_position = abs(stock_count) < 1e-9 and abs(option_notional_shares) > 0
+
+            needs_retry = source == "unavailable" or (
+                option_only_position and source in RETRYABLE_UNDERLYING_SOURCES
+            )
+            if not needs_retry:
+                quote_retry_state.pop(symbol, None)
+                continue
+
+            state = quote_retry_state.get(symbol, {})
+            attempts = int(safe_float_conversion(state.get('attempts')))
+            next_retry_ts = safe_float_conversion(state.get('next_retry_ts'))
+
+            if attempts == 0:
+                attempts = 1
+                next_retry_ts = retry_now_ts + QUOTE_RETRY_COOLDOWN_SECONDS
+            elif retry_now_ts >= next_retry_ts:
+                attempts += 1
+                next_retry_ts = retry_now_ts + QUOTE_RETRY_COOLDOWN_SECONDS
+
+            if attempts > QUOTE_RETRY_MAX_ATTEMPTS:
+                quote_retry_state.pop(symbol, None)
+                retry_exhausted_symbols.append(symbol)
+                continue
+
+            quote_retry_state[symbol] = {
+                'attempts': attempts,
+                'next_retry_ts': next_retry_ts,
+                'last_source': source,
+                'updated_ts': retry_now_ts,
+            }
+            retry_scheduled_symbols.append(symbol)
+
+        if retry_scheduled_symbols:
+            logger.info(
+                f"Retry queue scheduled for symbols: {sorted(retry_scheduled_symbols)}"
+            )
+        if retry_exhausted_symbols:
+            logger.warning(
+                f"Retry queue exhausted for symbols (max {QUOTE_RETRY_MAX_ATTEMPTS}): {sorted(retry_exhausted_symbols)}"
+            )
 
         underlying_df = pd.DataFrame(underlying_data)
         logger.info(f"Created dataframe with {len(underlying_df)} rows")
@@ -1332,6 +1696,8 @@ st.title("Interactive Brokers Portfolio Viewer")
 # Status indicator in sidebar
 st.sidebar.title("IB Connection Status")
 connection_status = st.sidebar.empty()
+diagnostic_status = st.sidebar.empty()
+diagnostic_detail = st.sidebar.empty()
 
 if not ib.isConnected():
     if st.sidebar.button("Connect to TWS"):
@@ -1362,23 +1728,41 @@ options_display = st.empty()
 
 # Auto-refresh control (using st.rerun)
 auto_refresh = st.sidebar.checkbox("Auto Refresh", value=False)
+refresh_interval = None
 if auto_refresh:
     refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 5, 60, 10)
-    time.sleep(refresh_interval)
+
+auto_retry_quotes = st.sidebar.checkbox("Auto Retry Weak Quotes", value=False)
+st.session_state['auto_retry_quotes_enabled'] = auto_retry_quotes
+if st.sidebar.button("Retry Weak Quotes Now"):
+    st.session_state['force_retry_quotes_now'] = True
     st.rerun()
+st.sidebar.caption(f"Market data type: {PREFERRED_MARKET_DATA_TYPE}")
 
 if st.sidebar.button("Clear Quote Cache"):
     runtime_cache = get_runtime_cache()
     runtime_cache['underlying_prices'].clear()
     runtime_cache['option_deltas'].clear()
+    runtime_cache['quote_retry_state'].clear()
     st.session_state.pop('underlying_price_cache', None)
     st.session_state.pop('option_delta_cache', None)
     st.sidebar.success("Cleared quote cache.")
+
+retry_state_preview = get_runtime_cache().get('quote_retry_state', {})
+if retry_state_preview:
+    retry_symbols = sorted(retry_state_preview.keys())
+    preview = ", ".join(retry_symbols[:6])
+    if len(retry_symbols) > 6:
+        preview = f"{preview}, ..."
+    st.sidebar.caption(f"Pending quote retries ({len(retry_symbols)}): {preview}")
+    if auto_retry_quotes and not auto_refresh:
+        st.sidebar.caption("Retries run on each manual refresh/click. Enable Auto Refresh for continuous retry cycles.")
 
 # Streamlit-compatible main execution
 def main():
     """Main function that runs within Streamlit's execution model"""
     setup_asyncio_event_loop()
+    register_ib_error_handler()
     
     logger.info("Starting application")
     
@@ -1399,6 +1783,18 @@ def main():
         connection_status.success("Connected to TWS")
     else:
         connection_status.error("Not connected to TWS")
+        st.session_state['last_data_health'] = {
+            'as_of': time.time(),
+            'connection_ok': False,
+            'connection_issue_count': 1,
+            'quote_issue_count': 0,
+            'farm_down_count': 0,
+            'farm_down_names': [],
+            'quote_issue_symbols': [],
+            'fallback_symbols': [],
+            'note': 'IB API session not connected',
+        }
+    render_connection_diagnostics()
     
     if connection_success:
         # Update portfolio data directly (no background threads)
@@ -1549,6 +1945,14 @@ def main():
                             st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as options_error:
                 logger.error(f"Error updating options data: {options_error}")
+
+        # Refresh diagnostics after data fetch updates health state.
+        render_connection_diagnostics()
+
+        if auto_refresh and refresh_interval:
+            logger.debug("Auto refresh rerun in %ss", refresh_interval)
+            time.sleep(refresh_interval)
+            st.rerun()
     else:
         st.error("Failed to connect to Interactive Brokers. Please make sure TWS or IB Gateway is running.")
 
