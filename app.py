@@ -33,12 +33,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("ib_app")
 
-def log_debug(message, level="info", display_ui=True, ui_container=None):
-    """Compatibility shim while migrating to direct logger usage."""
-    del display_ui, ui_container
-    log_func = getattr(logger, level.lower(), logger.info)
-    log_func(message)
-
 def time_operation(operation_name):
     """Decorator to time operations and log start/end/error."""
     def decorator(func):
@@ -213,7 +207,7 @@ def bounded_req_tickers(ib, contracts, timeout_seconds=2.0, chunk_size=8, label=
             try:
                 tickers.extend(ib.reqTickers(*batch))
             except Exception as batch_error:
-                log_debug(f"{label} batch request failed for {len(batch)} contracts: {batch_error}", "warning")
+                logger.warning(f"{label} batch request failed for {len(batch)} contracts: {batch_error}")
     finally:
         if original_timeout is not None:
             ib.RequestTimeout = original_timeout
@@ -234,7 +228,7 @@ def gather_option_market_data(ib, contracts, wait_seconds=0.6, chunk_size=6):
                 ticker = ib.reqMktData(contract, genericTickList='106')
                 active.append((contract, ticker))
             except Exception as request_error:
-                log_debug(f"Option market data request failed for {contract.localSymbol}: {request_error}", "warning")
+                logger.warning(f"Option market data request failed for {contract.localSymbol}: {request_error}")
 
         if not active:
             continue
@@ -242,7 +236,7 @@ def gather_option_market_data(ib, contracts, wait_seconds=0.6, chunk_size=6):
         try:
             ib.sleep(wait_seconds)
         except Exception as sleep_error:
-            log_debug(f"Option market data wait failed: {sleep_error}", "warning")
+            logger.warning(f"Option market data wait failed: {sleep_error}")
 
         for contract, ticker in active:
             ticker_by_key[option_contract_key(contract)] = ticker
@@ -266,7 +260,7 @@ def gather_stock_market_data(ib, contracts, wait_seconds=0.5, chunk_size=12):
                 ticker = ib.reqMktData(contract)
                 active.append((contract, ticker))
             except Exception as request_error:
-                log_debug(f"Stock market data request failed for {contract.symbol}: {request_error}", "warning")
+                logger.warning(f"Stock market data request failed for {contract.symbol}: {request_error}")
 
         if not active:
             continue
@@ -274,7 +268,7 @@ def gather_stock_market_data(ib, contracts, wait_seconds=0.5, chunk_size=12):
         try:
             ib.sleep(wait_seconds)
         except Exception as sleep_error:
-            log_debug(f"Stock market data wait failed: {sleep_error}", "warning")
+            logger.warning(f"Stock market data wait failed: {sleep_error}")
 
         for contract, ticker in active:
             ticker_by_symbol[contract.symbol] = ticker
@@ -459,24 +453,24 @@ async def get_positions_compat(ib, timeout=20.0):
 async def async_get_portfolio_data(ib):
     try:
         # Debug info
-        log_debug("Starting portfolio data retrieval", "info")
+        logger.info("Starting portfolio data retrieval")
         try:
             ib.reqMarketDataType(4)
         except Exception as market_data_type_error:
-            log_debug(f"Unable to set delayed-frozen market data type: {market_data_type_error}", "warning")
+            logger.warning(f"Unable to set delayed-frozen market data type: {market_data_type_error}")
         
         # Get account summary with timeout
-        log_debug("Fetching account data...", "info")
+        logger.info("Fetching account data...")
         
         try:
             # Fetch account summary with a timeout
             account_summary = await get_account_summary_compat(ib, timeout=20.0)
             
             if not account_summary:
-                log_debug("Account summary is empty", "warning")
+                logger.warning("Account summary is empty")
                 return None, None, None
                 
-            log_debug(f"Got {len(account_summary)} account values", "info")
+            logger.info(f"Got {len(account_summary)} account values")
             
             account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], 
                                 columns=['Tag', 'Value'])
@@ -485,31 +479,31 @@ async def async_get_portfolio_data(ib):
             # Update debug state
             
         except asyncio.TimeoutError:
-            log_debug("Timeout occurred while waiting for account data (20s)", "error")
+            logger.error("Timeout occurred while waiting for account data (20s)")
             return None, None, None
         except Exception as account_error:
-            log_debug(f"Error getting account data: {account_error}", "error")
-            log_debug(traceback.format_exc(), "error", display_ui=False)
+            logger.error(f"Error getting account data: {account_error}")
+            logger.error(traceback.format_exc())
             return None, None, None
         
         # Get positions with timeout
-        log_debug("Fetching positions...", "info")
+        logger.info("Fetching positions...")
         
         try:
             # Fetch positions with a timeout
             positions = await get_positions_compat(ib, timeout=20.0)
             positions = positions or []
             if not positions:
-                log_debug("No positions found", "warning")
+                logger.warning("No positions found")
             else:
-                log_debug(f"Got {len(positions)} positions", "info")
+                logger.info(f"Got {len(positions)} positions")
             
         except asyncio.TimeoutError:
-            log_debug("Timeout occurred while waiting for position data (20s)", "error")
+            logger.error("Timeout occurred while waiting for position data (20s)")
             positions = []
         except Exception as positions_error:
-            log_debug(f"Error getting positions: {positions_error}", "error")
-            log_debug(traceback.format_exc(), "error", display_ui=False)
+            logger.error(f"Error getting positions: {positions_error}")
+            logger.error(traceback.format_exc())
             positions = []
         
         # Create a dictionary to store positions by underlying
@@ -517,7 +511,7 @@ async def async_get_portfolio_data(ib):
         underlying_price_cache = {}
         
         # Process positions
-        log_debug("Processing positions...", "info")
+        logger.info("Processing positions...")
         position_count = 0
         position_errors = 0
         
@@ -528,7 +522,7 @@ async def async_get_portfolio_data(ib):
                 contract = pos.contract
                 underlying_symbol = contract.symbol
                 
-                log_debug(f"Processing position {position_count}/{len(positions)}: {underlying_symbol}", "debug", display_ui=False)
+                logger.debug(f"Processing position {position_count}/{len(positions)}: {underlying_symbol}")
                 
                 if underlying_symbol in underlying_price_cache:
                     underlying_price = underlying_price_cache[underlying_symbol]
@@ -554,7 +548,7 @@ async def async_get_portfolio_data(ib):
                             if tickers:
                                 underlying_price = pick_price_from_ticker(tickers[0])
                     except Exception as ticker_error:
-                        log_debug(f"Error requesting market data for {underlying_symbol}: {ticker_error}", "warning")
+                        logger.warning(f"Error requesting market data for {underlying_symbol}: {ticker_error}")
                         position_errors += 1
                         continue
                     finally:
@@ -568,15 +562,15 @@ async def async_get_portfolio_data(ib):
                         fallback_price = safe_float_conversion(pos.avgCost)
                         if fallback_price > 0:
                             underlying_price = fallback_price
-                            log_debug(f"No market price for {underlying_symbol}, using avg cost: {underlying_price}", "warning")
+                            logger.warning(f"No market price for {underlying_symbol}, using avg cost: {underlying_price}")
                         else:
                             underlying_price = 100.0
-                            log_debug(f"No price data for {underlying_symbol}, using 100 placeholder", "warning")
+                            logger.warning(f"No price data for {underlying_symbol}, using 100 placeholder")
 
                     underlying_price_cache[underlying_symbol] = underlying_price
                 
                 if position_count <= 5:  # Show debug for first few positions
-                    log_debug(f"Position {position_count}: {underlying_symbol} @ {underlying_price}", "debug")
+                    logger.debug(f"Position {position_count}: {underlying_symbol} @ {underlying_price}")
                 
                 if underlying_symbol not in positions_by_underlying:
                     positions_by_underlying[underlying_symbol] = {
@@ -596,19 +590,19 @@ async def async_get_portfolio_data(ib):
                     try:
                         await process_option_position(ib, contract, pos, underlying_symbol, underlying_price, positions_by_underlying)
                     except Exception as option_error:
-                        log_debug(f"Error processing option {contract.symbol}: {option_error}", "warning")
+                        logger.warning(f"Error processing option {contract.symbol}: {option_error}")
                         position_errors += 1
                         continue
             
             except Exception as position_error:
-                log_debug(f"Error processing position {position_count}: {position_error}", "warning")
+                logger.warning(f"Error processing position {position_count}: {position_error}")
                 position_errors += 1
                 continue
         
         if position_errors > 0:
-            log_debug(f"Encountered errors in {position_errors}/{position_count} positions", "warning")
+            logger.warning(f"Encountered errors in {position_errors}/{position_count} positions")
         
-        log_debug("Creating dataframe...", "info")
+        logger.info("Creating dataframe...")
         
         # Create DataFrame for display
         underlying_data = []
@@ -633,14 +627,14 @@ async def async_get_portfolio_data(ib):
                 
                 total_npv += total_notional
             except Exception as calc_error:
-                log_debug(f"Error calculating values for {symbol}: {calc_error}", "warning")
+                logger.warning(f"Error calculating values for {symbol}: {calc_error}")
                 continue
         
         underlying_df = pd.DataFrame(underlying_data)
-        log_debug(f"Created dataframe with {len(underlying_df)} rows", "info")
+        logger.info(f"Created dataframe with {len(underlying_df)} rows")
         
         # Calculate portfolio metrics
-        log_debug("Calculating metrics...", "info")
+        logger.info("Calculating metrics...")
         try:
             nlv = get_account_value(account_df, 'NetLiquidation', numeric=True, default=0.0)
             gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
@@ -657,31 +651,31 @@ async def async_get_portfolio_data(ib):
             account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
             account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
             
-            log_debug("Metrics calculated successfully", "info")
+            logger.info("Metrics calculated successfully")
         except Exception as metrics_error:
-            log_debug(f"Error calculating metrics: {metrics_error}", "error")
-            log_debug(traceback.format_exc(), "error", display_ui=False)
+            logger.error(f"Error calculating metrics: {metrics_error}")
+            logger.error(traceback.format_exc())
             # Handle case where account data doesn't have the expected fields
             pass
         
-        log_debug("Portfolio data retrieval complete", "info")
+        logger.info("Portfolio data retrieval complete")
         return account_df, underlying_df, positions_by_underlying
         
     except Exception as e:
-        log_debug(f"Error in portfolio data retrieval: {str(e)}", "error")
-        log_debug(traceback.format_exc(), "error", display_ui=False)
+        logger.error(f"Error in portfolio data retrieval: {str(e)}")
+        logger.error(traceback.format_exc())
         return None, None, None
 
 # Helper function to process option positions
 async def process_option_position(ib, contract, pos, underlying_symbol, underlying_price, positions_by_underlying):
-    log_debug(f"Processing option: {contract.symbol} {contract.right} {contract.strike}", "debug", display_ui=False)
+    logger.debug(f"Processing option: {contract.symbol} {contract.right} {contract.strike}")
     
     # Get option data with timeout
     try:
         option_ticker_task = ib.reqMktData(contract)
         await asyncio.sleep(0.2)  # Small delay to respect rate limits
     except Exception as ticker_error:
-        log_debug(f"Error requesting option market data: {ticker_error}", "warning")
+        logger.warning(f"Error requesting option market data: {ticker_error}")
         raise
     
     # Calculate option delta (if available, otherwise use approximation)
@@ -697,7 +691,7 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
                 break
         await asyncio.sleep(0.1)
 
-    log_debug(f"Got delta from model Greeks: {delta}", "debug", display_ui=False)
+    logger.debug(f"Got delta from model Greeks: {delta}")
 
     # Fallback delta calculation when model greeks are unavailable or invalid.
     if delta is None:
@@ -705,7 +699,7 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
             delta = 0.7 if underlying_price > contract.strike else 0.3
         else:  # Put option
             delta = -0.7 if underlying_price < contract.strike else -0.3
-        log_debug(f"Using fallback delta: {delta}", "debug", display_ui=False)
+        logger.debug(f"Using fallback delta: {delta}")
     
     # Signed share-equivalent notional (puts are negative delta).
     option_multiplier = 100
@@ -721,7 +715,7 @@ async def process_option_position(ib, contract, pos, underlying_symbol, underlyi
     except Exception:
         pass
 
-    log_debug(f"Option processed: notional={option_notional}, value={option_value}", "debug", display_ui=False)
+    logger.debug(f"Option processed: notional={option_notional}, value={option_value}")
 
 @time_operation("Portfolio Data Retrieval")
 def get_portfolio_data_sync(ib):
@@ -729,37 +723,37 @@ def get_portfolio_data_sync(ib):
     Main synchronous portfolio data path.
     Keeps IB requests on one thread/loop context to avoid nested event-loop errors.
     """
-    log_debug("Starting portfolio data retrieval", "info")
+    logger.info("Starting portfolio data retrieval")
     try:
         started_at = time.time()
         try:
             ib.reqMarketDataType(4)
         except Exception as market_data_type_error:
-            log_debug(f"Unable to set delayed-frozen market data type: {market_data_type_error}", "warning")
+            logger.warning(f"Unable to set delayed-frozen market data type: {market_data_type_error}")
 
-        log_debug("Fetching account data...", "info")
+        logger.info("Fetching account data...")
         t0 = time.time()
         account_summary = ib.accountSummary()
-        log_debug(f"Fetched account data in {time.time() - t0:.2f}s", "debug", display_ui=False)
+        logger.debug(f"Fetched account data in {time.time() - t0:.2f}s")
         if not account_summary:
-            log_debug("Account summary is empty", "warning")
+            logger.warning("Account summary is empty")
             return None, None, None
 
         account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], columns=['Tag', 'Value'])
         account_df = account_df.set_index('Tag')
 
-        log_debug("Fetching positions...", "info")
+        logger.info("Fetching positions...")
         t0 = time.time()
         positions = ib.positions() or []
-        log_debug(f"Fetched positions in {time.time() - t0:.2f}s", "debug", display_ui=False)
+        logger.debug(f"Fetched positions in {time.time() - t0:.2f}s")
         if positions:
-            log_debug(f"Got {len(positions)} positions", "info")
+            logger.info(f"Got {len(positions)} positions")
         else:
-            log_debug("No positions found", "warning")
+            logger.warning("No positions found")
 
         t0 = time.time()
         portfolio_items = ib.portfolio() or []
-        log_debug(f"Fetched portfolio items in {time.time() - t0:.2f}s", "debug", display_ui=False)
+        logger.debug(f"Fetched portfolio items in {time.time() - t0:.2f}s")
 
         positions_by_underlying = {}
         position_errors = 0
@@ -920,10 +914,8 @@ def get_portfolio_data_sync(ib):
                 wait_seconds=wait_seconds,
                 chunk_size=chunk_size,
             )
-            log_debug(
-                f"{label}: requested {len(stock_contracts)} underlying streams in {time.time() - t0:.2f}s",
-                "debug",
-                display_ui=False,
+            logger.debug(
+                f"{label}: requested {len(stock_contracts)} underlying streams in {time.time() - t0:.2f}s"
             )
 
             for symbol, ticker in stock_tickers.items():
@@ -941,10 +933,8 @@ def get_portfolio_data_sync(ib):
                 wait_seconds=0.6,
                 chunk_size=6,
             )
-            log_debug(
-                f"Requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s",
-                "debug",
-                display_ui=False,
+            logger.debug(
+                f"Requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s"
             )
             absorb_option_tickers(option_tickers)
 
@@ -953,10 +943,8 @@ def get_portfolio_data_sync(ib):
         # If live coverage is poor, do a slower second pass before relying on cache/fallback.
         min_live_quotes = max(5, int(len(underlying_symbols) * 0.5))
         if underlying_symbols and len(underlying_market_price_map) < min_live_quotes:
-            log_debug(
-                f"Low live quote coverage ({len(underlying_market_price_map)}/{len(underlying_symbols)}); retrying fetch",
-                "warning",
-                display_ui=False,
+            logger.warning(
+                f"Low live quote coverage ({len(underlying_market_price_map)}/{len(underlying_symbols)}); retrying fetch"
             )
             if option_contracts:
                 t0 = time.time()
@@ -966,10 +954,8 @@ def get_portfolio_data_sync(ib):
                     wait_seconds=1.0,
                     chunk_size=4,
                 )
-                log_debug(
-                    f"Retry fetch: requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s",
-                    "debug",
-                    display_ui=False,
+                logger.debug(
+                    f"Retry fetch: requested {len(option_contracts)} option streams in {time.time() - t0:.2f}s"
                 )
                 absorb_option_tickers(option_tickers)
 
@@ -979,7 +965,7 @@ def get_portfolio_data_sync(ib):
             try:
                 contract = pos.contract
                 underlying_symbol = contract.symbol
-                log_debug(f"Processing position {idx}/{len(positions)}: {underlying_symbol}", "debug", display_ui=False)
+                logger.debug(f"Processing position {idx}/{len(positions)}: {underlying_symbol}")
 
                 if underlying_symbol not in positions_by_underlying:
                     positions_by_underlying[underlying_symbol] = {
@@ -1077,14 +1063,14 @@ def get_portfolio_data_sync(ib):
 
                     positions_by_underlying[underlying_symbol]['option_actual_value'] += option_actual_value
             except Exception as position_error:
-                log_debug(f"Error processing position {idx}: {position_error}", "warning")
+                logger.warning(f"Error processing position {idx}: {position_error}")
                 position_errors += 1
                 continue
 
         if position_errors > 0:
-            log_debug(f"Encountered errors in {position_errors}/{len(positions)} positions", "warning")
+            logger.warning(f"Encountered errors in {position_errors}/{len(positions)} positions")
 
-        log_debug("Creating dataframe...", "info")
+        logger.info("Creating dataframe...")
         underlying_data = []
         total_npv = 0.0
 
@@ -1136,7 +1122,7 @@ def get_portfolio_data_sync(ib):
                 })
                 total_npv += total_notional
             except Exception as calc_error:
-                log_debug(f"Error calculating values for {symbol}: {calc_error}", "warning")
+                logger.warning(f"Error calculating values for {symbol}: {calc_error}")
                 continue
 
         source_counts = {}
@@ -1144,19 +1130,19 @@ def get_portfolio_data_sync(ib):
             source = row.get('Underlying Price Source', 'unknown')
             source_counts[source] = source_counts.get(source, 0) + 1
         if source_counts:
-            log_debug(f"Underlying price sources: {source_counts}", "info", display_ui=False)
+            logger.info(f"Underlying price sources: {source_counts}")
             fallback_symbols = [
                 row.get('Symbol')
                 for row in underlying_data
                 if row.get('Underlying Price Source') in ('cost_basis', 'unavailable')
             ]
             if fallback_symbols:
-                log_debug(f"Fallback-priced symbols: {fallback_symbols}", "info", display_ui=False)
+                logger.info(f"Fallback-priced symbols: {fallback_symbols}")
 
         underlying_df = pd.DataFrame(underlying_data)
-        log_debug(f"Created dataframe with {len(underlying_df)} rows", "info")
+        logger.info(f"Created dataframe with {len(underlying_df)} rows")
 
-        log_debug("Calculating metrics...", "info")
+        logger.info("Calculating metrics...")
         nlv = get_account_value(account_df, 'NetLiquidation', numeric=True, default=0.0)
         gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
         if not is_valid_number(total_npv):
@@ -1169,13 +1155,13 @@ def get_portfolio_data_sync(ib):
         account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
         account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
 
-        log_debug("Metrics calculated successfully", "info")
-        log_debug(f"Portfolio data retrieval complete in {time.time() - started_at:.2f}s", "info")
+        logger.info("Metrics calculated successfully")
+        logger.info(f"Portfolio data retrieval complete in {time.time() - started_at:.2f}s")
         return account_df, underlying_df, positions_by_underlying
 
     except Exception as e:
-        log_debug(f"Error in portfolio data retrieval: {str(e)}", "error")
-        log_debug(traceback.format_exc(), "error", display_ui=False)
+        logger.error(f"Error in portfolio data retrieval: {str(e)}")
+        logger.error(traceback.format_exc())
         return None, None, None
 
 # Async wrapper for option chain data
@@ -1394,16 +1380,16 @@ def main():
     """Main function that runs within Streamlit's execution model"""
     setup_asyncio_event_loop()
     
-    log_debug("Starting application", "info")
+    logger.info("Starting application")
     
     # Try to connect if not already connected
     if not ib.isConnected():
-        log_debug("Attempting connection to TWS", "info")
+        logger.info("Attempting connection to TWS")
         try:
             connection_success = connect_to_ib()
         except Exception as conn_error:
-            log_debug(f"Unhandled exception in connect_to_ib: {conn_error}", "error")
-            log_debug(traceback.format_exc(), "error", display_ui=False)
+            logger.error(f"Unhandled exception in connect_to_ib: {conn_error}")
+            logger.error(traceback.format_exc())
             connection_success = False
     else:
         connection_success = True
@@ -1448,9 +1434,9 @@ def main():
                             metrics_cols[5].metric("Buying Power", 
                                                  format_currency(buying_power))
                         except Exception as e:
-                            log_debug(f"Error updating metrics: {e}", "error")
+                            logger.error(f"Error updating metrics: {e}")
                     except Exception as container_error:
-                        log_debug(f"Error with metrics container: {container_error}", "error")
+                        logger.error(f"Error with metrics container: {container_error}")
                 
                 # Update underlying positions table
                 with main_content:
@@ -1506,9 +1492,9 @@ def main():
                         # Show last update time
                         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     except Exception as table_error:
-                        log_debug(f"Error updating positions table: {table_error}", "error")
+                        logger.error(f"Error updating positions table: {table_error}")
         except Exception as update_error:
-            log_debug(f"Error updating portfolio data: {update_error}", "error")
+            logger.error(f"Error updating portfolio data: {update_error}")
             
         # Handle options data
         if ticker_input and search_button:
@@ -1562,7 +1548,7 @@ def main():
                             # Show last update time
                             st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as options_error:
-                log_debug(f"Error updating options data: {options_error}", "error")
+                logger.error(f"Error updating options data: {options_error}")
     else:
         st.error("Failed to connect to Interactive Brokers. Please make sure TWS or IB Gateway is running.")
 
