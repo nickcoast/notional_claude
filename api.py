@@ -31,6 +31,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ib_api")
 
+# ib_insync emits "Can't find EId with tickerId:N" at WARNING level when
+# cancelMktData is called for a request IB never acknowledged (common after
+# hours).  These are benign; suppress them to keep the log readable.
+class _SuppressEIdWarnings(logging.Filter):
+    def filter(self, record):
+        return "Can't find EId" not in record.getMessage()
+
+logging.getLogger("ib_insync.wrapper").addFilter(_SuppressEIdWarnings())
+
 poll_interval = int(os.getenv("IB_POLL_INTERVAL", str(DEFAULT_POLL_INTERVAL)))
 service = IBPollingService(poll_interval=poll_interval)
 
