@@ -1,4 +1,6 @@
 import logging
+import math
+from datetime import date, datetime
 
 from ib_insync import util
 
@@ -71,6 +73,66 @@ def option_delta_from_ticker(ticker):
         if is_valid_number(delta):
             return float(delta)
     return None
+
+
+_RISK_FREE_RATE = 0.05  # used only when IB doesn't supply delta directly
+
+
+def _phi(x: float) -> float:
+    """Standard normal CDF via math.erf — no scipy required."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def option_delta_bs_fallback(ticker, strike: float, expiry_str: str, right: str):
+    """
+    Compute Black-Scholes delta when IB returns NaN for it but does supply
+    undPrice and impliedVol in the greeks object (common with delayed/frozen
+    market data type 3).
+
+    Returns a float in [-1, 1] or None if insufficient inputs.
+    """
+    und_price = None
+    impl_vol = None
+    for greek_field in ("modelGreeks", "bidGreeks", "askGreeks", "lastGreeks"):
+        greeks = getattr(ticker, greek_field, None)
+        if not greeks:
+            continue
+        if und_price is None:
+            up = getattr(greeks, "undPrice", None)
+            if is_valid_number(up) and float(up) > 0:
+                und_price = float(up)
+        if impl_vol is None:
+            iv = getattr(greeks, "impliedVol", None)
+            if is_valid_number(iv) and float(iv) > 0:
+                impl_vol = float(iv)
+        if und_price is not None and impl_vol is not None:
+            break
+
+    if und_price is None or impl_vol is None:
+        return None
+
+    # Parse expiry string (YYYYMMDD or YYYYMM)
+    try:
+        fmt = "%Y%m%d" if len(expiry_str) == 8 else "%Y%m"
+        expiry_date = datetime.strptime(expiry_str, fmt).date()
+    except (ValueError, AttributeError):
+        return None
+
+    T = (expiry_date - date.today()).days / 365.0
+    if T <= 0:
+        return None
+
+    try:
+        d1 = (math.log(und_price / strike) + (_RISK_FREE_RATE + 0.5 * impl_vol ** 2) * T) / (
+            impl_vol * math.sqrt(T)
+        )
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if right.upper() in ("C", "CALL"):
+        return _phi(d1)
+    else:
+        return _phi(d1) - 1.0
 
 
 def option_underlying_price_from_ticker(ticker):

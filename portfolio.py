@@ -11,6 +11,7 @@ from market_data import (
     gather_stock_market_data,
     gather_stock_snapshot_data,
     option_contract_key,
+    option_delta_bs_fallback,
     option_delta_from_ticker,
     option_underlying_price_from_ticker,
     pick_price_from_ticker,
@@ -321,6 +322,11 @@ def get_portfolio_data_sync(
         def absorb_option_tickers(option_tickers):
             for key, ticker in option_tickers.items():
                 delta = option_delta_from_ticker(ticker)
+                if not is_valid_number(delta):
+                    # IB delayed/frozen data often provides undPrice + impliedVol
+                    # but leaves delta as NaN.  Fall back to Black-Scholes.
+                    _sym, expiry_str, strike, right = key[0], key[1], key[2], key[3]
+                    delta = option_delta_bs_fallback(ticker, strike, expiry_str, right)
                 if is_valid_number(delta):
                     option_delta_map[key] = float(delta)
                     cache_option_delta(key, delta)

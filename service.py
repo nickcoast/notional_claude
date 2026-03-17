@@ -4,11 +4,13 @@ snapshots in a background thread.  FastAPI (api.py) reads the cached snapshot;
 all IB calls stay confined to the polling thread's event loop.
 """
 
+import json
 import logging
 import random
 import threading
 import time
 from datetime import date
+from pathlib import Path
 from typing import Optional
 
 from ib_insync import IB
@@ -24,6 +26,53 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Option delta cache is saved here between service restarts so last-known
+# values survive market close (IB doesn't provide model greeks after hours).
+DELTA_CACHE_FILE = Path("delta_cache.json")
+
+
+def _load_delta_cache() -> dict:
+    """
+    Load persisted option delta cache from disk.
+
+    Returns {} if the file doesn't exist or can't be parsed.  The on-disk
+    format is a JSON array of [[symbol, expiry, strike, right, mult, cls], delta]
+    pairs — matching the tuple shape produced by option_contract_key().
+    """
+    if not DELTA_CACHE_FILE.exists():
+        return {}
+    try:
+        with DELTA_CACHE_FILE.open() as f:
+            entries = json.load(f)
+        result = {}
+        for key_list, value in entries:
+            key = (
+                key_list[0],          # symbol
+                key_list[1],          # expiry
+                float(key_list[2]),   # strike
+                key_list[3],          # right
+                key_list[4],          # multiplier string
+                key_list[5],          # tradingClass
+            )
+            result[key] = float(value)
+        logger.info("Loaded delta cache from disk (%d entries)", len(result))
+        return result
+    except Exception as exc:
+        logger.warning("Failed to load delta cache: %s", exc)
+        return {}
+
+
+def _save_delta_cache(cache: dict) -> None:
+    """Persist the option delta cache to disk.  Silently swallows write errors."""
+    try:
+        entries = [[list(key), value] for key, value in cache.items()]
+        with DELTA_CACHE_FILE.open("w") as f:
+            json.dump(entries, f)
+        logger.debug("Delta cache saved (%d entries)", len(entries))
+    except Exception as exc:
+        logger.warning("Failed to save delta cache: %s", exc)
+
 
 # IB doesn't publish a hard minimum for portfolio snapshot polling.  Pacing
 # rules target individual request rates (50 msg/s) and historical data — not
@@ -143,7 +192,9 @@ class IBPollingService:
         self._poll_thread: Optional[threading.Thread] = None
 
         # Survive across poll cycles (mirrors session_state in the Streamlit app).
-        self._option_delta_cache: dict = {}
+        # Delta cache is also pre-loaded from disk so last-known values are
+        # available immediately — including after a restart during market close.
+        self._option_delta_cache: dict = _load_delta_cache()
         self._underlying_price_cache: dict = {}
         self._earnings_cache = EarningsCache()
 
@@ -232,6 +283,10 @@ class IBPollingService:
             underlying_price_cache=self._underlying_price_cache,
         )
         as_of = time.time()
+
+        # Persist delta cache so last-known values survive a restart.
+        if self._option_delta_cache:
+            _save_delta_cache(self._option_delta_cache)
 
         # Trigger a background earnings refresh whenever symbols are known.
         # The cache self-throttles to once per 24 h; this call is cheap.
