@@ -56,7 +56,16 @@
         <tbody>
             {% for pos in snapshot.positions | sort(attribute='symbol') %}
             <tr class="border-b border-gray-800/60 hover:bg-gray-800/30">
-                <td class="py-1.5 pr-4 text-left font-bold text-white">{{ pos.symbol }}</td>
+                <td class="py-1.5 pr-4 text-left font-bold text-white
+                    {%- if pos.earnings_days is not none -%}
+                        {%- if pos.earnings_days <= 3 %} bg-red-900/70
+                        {%- elif pos.earnings_days <= 7 %} bg-orange-900/60
+                        {%- elif pos.earnings_days <= 30 %} bg-amber-900/30
+                        {%- endif -%}
+                    {%- endif %}"
+                    {%- if pos.earnings_date %} title="Earnings: {{ pos.earnings_date }} (in {{ pos.earnings_days }} day{{ 's' if pos.earnings_days != 1 else '' }})"{% endif %}>
+                    {{ pos.symbol }}
+                </td>
 
                 <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
                     {{ pos.underlying_market_price | currency }}

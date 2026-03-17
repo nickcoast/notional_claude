@@ -8,11 +8,13 @@ import logging
 import random
 import threading
 import time
+from datetime import date
 from typing import Optional
 
 from ib_insync import IB
 
 import portfolio as portfolio_module
+from earnings import EarningsCache
 from utils import (
     configure_locale,
     get_account_value,
@@ -33,7 +35,13 @@ DEFAULT_POLL_INTERVAL = 15
 
 # ── Snapshot serialization ────────────────────────────────────────────────────
 
-def _serialize_snapshot(account_df, underlying_df, health: dict, as_of: float) -> dict:
+def _serialize_snapshot(
+    account_df,
+    underlying_df,
+    health: dict,
+    as_of: float,
+    earnings: Optional[dict] = None,
+) -> dict:
     """
     Convert portfolio DataFrames to a JSON-serializable snapshot dict.
 
@@ -51,6 +59,9 @@ def _serialize_snapshot(account_df, underlying_df, health: dict, as_of: float) -
             "standard_leverage_ratio": safe_float_conversion(get_account_value(account_df, "Standard Leverage Ratio")),
             "buying_power":           get_account_value(account_df, "BuyingPower",                          numeric=True, default=0.0),
         }
+
+    earnings = earnings or {}
+    today = date.today()
 
     positions = []
     if underlying_df is not None and not underlying_df.empty:
@@ -75,6 +86,23 @@ def _serialize_snapshot(account_df, underlying_df, health: dict, as_of: float) -
                     entry[dst_key] = val
                 else:
                     entry[dst_key] = float(val) if is_valid_number(val) else None
+
+            # Earnings annotation
+            sym = entry.get("symbol", "")
+            edate_str = earnings.get(sym)
+            if edate_str:
+                try:
+                    edate = date.fromisoformat(edate_str)
+                    edays = (edate - today).days
+                    entry["earnings_date"] = edate_str
+                    entry["earnings_days"] = edays if edays >= 0 else None
+                except ValueError:
+                    entry["earnings_date"] = None
+                    entry["earnings_days"] = None
+            else:
+                entry["earnings_date"] = None
+                entry["earnings_days"] = None
+
             positions.append(entry)
 
     return {
@@ -117,6 +145,7 @@ class IBPollingService:
         # Survive across poll cycles (mirrors session_state in the Streamlit app).
         self._option_delta_cache: dict = {}
         self._underlying_price_cache: dict = {}
+        self._earnings_cache = EarningsCache()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -203,7 +232,17 @@ class IBPollingService:
             underlying_price_cache=self._underlying_price_cache,
         )
         as_of = time.time()
-        snapshot = _serialize_snapshot(account_df, underlying_df, health, as_of)
+
+        # Trigger a background earnings refresh whenever symbols are known.
+        # The cache self-throttles to once per 24 h; this call is cheap.
+        if underlying_df is not None and not underlying_df.empty:
+            symbols = underlying_df["Symbol"].dropna().unique().tolist()
+            self._earnings_cache.refresh_if_stale(symbols)
+
+        snapshot = _serialize_snapshot(
+            account_df, underlying_df, health, as_of,
+            earnings=self._earnings_cache.snapshot(),
+        )
 
         with self._lock:
             self._snapshot = snapshot
