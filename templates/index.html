@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IB Portfolio</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+    <div class="px-4 py-4 max-w-screen-2xl mx-auto">
+
+        <div class="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
+            <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
+                IB Portfolio
+            </h1>
+        </div>
+
+        <!-- Live content — replaced on each SSE push from /stream-html -->
+        <div hx-ext="sse" sse-connect="/stream-html" sse-swap="message">
+            <div class="text-gray-600 text-sm py-12 text-center">
+                Connecting to data stream…
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>

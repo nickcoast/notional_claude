@@ -1,0 +1,114 @@
+{%- set health = snapshot.health -%}
+{%- set m = snapshot.metrics -%}
+
+{# ── Health banner (hidden when healthy) ─────────────────────────────────── #}
+{% if not health.connection_ok %}
+<div class="mb-4 px-3 py-2 rounded text-xs bg-red-950 border border-red-800 text-red-300">
+    ✗ Not connected to TWS{% if health.note %}: {{ health.note }}{% endif %}
+</div>
+{% elif health.quote_issue_count > 0 or health.farm_down_count > 0 %}
+<div class="mb-4 px-3 py-2 rounded text-xs bg-yellow-950 border border-yellow-800 text-yellow-300">
+    ⚠ Connected — quote degradation: {{ health.quote_issue_count }} quote issue(s),
+    {{ health.farm_down_count }} farm(s) down
+    {%- if health.farm_down_names %} · farms: {{ health.farm_down_names | join(', ') }}{% endif %}
+</div>
+{% endif %}
+
+{# ── Metrics row ─────────────────────────────────────────────────────────── #}
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 mb-5">
+    {% for label, value, is_ratio in [
+        ('Net Liquidation',    m.net_liquidation,         false),
+        ('Gross Position',     m.gross_position_value,    false),
+        ('NGAV',               m.ngav,                    false),
+        ('Std Leverage',       m.standard_leverage_ratio, true),
+        ('Notional Leverage',  m.notional_leverage_ratio, true),
+        ('Buying Power',       m.buying_power,            false),
+    ] %}
+    <div class="bg-gray-800 rounded px-3 py-2">
+        <div class="text-xs text-gray-500 mb-1">{{ label }}</div>
+        <div class="text-sm font-semibold tabular-nums">
+            {%- if is_ratio -%}
+                {{ value | number(2) }}×
+            {%- else -%}
+                {{ value | currency }}
+            {%- endif -%}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{# ── Positions table ─────────────────────────────────────────────────────── #}
+<div class="overflow-x-auto">
+    <table class="w-full text-xs border-collapse">
+        <thead>
+            <tr class="text-gray-500 border-b border-gray-700">
+                <th class="text-left py-2 pr-4 font-medium">Symbol</th>
+                <th class="text-right py-2 px-2 font-medium">Mkt Price</th>
+                <th class="text-right py-2 px-2 font-medium">Shares</th>
+                <th class="text-right py-2 px-2 font-medium">Stock Value</th>
+                <th class="text-right py-2 px-2 font-medium">Opt δ Shares</th>
+                <th class="text-right py-2 px-2 font-medium">Opt Notional</th>
+                <th class="text-right py-2 px-2 font-medium">Opt Actual</th>
+                <th class="text-right py-2 px-2 font-medium">NPV</th>
+                <th class="text-left py-2 pl-4 font-medium">Source</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for pos in snapshot.positions | sort(attribute='symbol') %}
+            <tr class="border-b border-gray-800/60 hover:bg-gray-800/30">
+                <td class="py-1.5 pr-4 text-left font-bold text-white">{{ pos.symbol }}</td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
+                    {{ pos.underlying_market_price | currency }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
+                    {{ pos.stock_count | number(0) }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
+                    {{ pos.stock_value | currency }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums
+                    {{ 'text-red-400' if pos.option_notional_shares and pos.option_notional_shares < 0 else 'text-gray-300' }}">
+                    {{ pos.option_notional_shares | number(1) }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums
+                    {{ 'text-red-400' if pos.option_notional_value and pos.option_notional_value < 0 else 'text-gray-300' }}">
+                    {{ pos.option_notional_value | currency }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums
+                    {{ 'text-red-400' if pos.option_actual_value and pos.option_actual_value < 0 else 'text-gray-300' }}">
+                    {{ pos.option_actual_value | currency }}
+                </td>
+
+                <td class="py-1.5 px-2 text-right tabular-nums font-semibold
+                    {{ 'text-red-400' if pos.npv and pos.npv < 0 else 'text-emerald-400' }}">
+                    {{ pos.npv | currency }}
+                </td>
+
+                <td class="py-1.5 pl-4 text-left
+                    {% if pos.underlying_price_source == 'unavailable' %}text-red-400
+                    {% elif pos.underlying_price_source == 'cost_basis' %}text-orange-400
+                    {% elif pos.underlying_price_source in ('cached', 'snapshot_retry') %}text-yellow-500
+                    {% else %}text-gray-600{% endif %}">
+                    {{ pos.underlying_price_source or '—' }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{# ── Footer ──────────────────────────────────────────────────────────────── #}
+<div class="mt-3 flex items-center justify-between text-xs text-gray-600">
+    <span>Updated {{ snapshot.as_of | ts }}</span>
+    {% if health.fallback_symbols %}
+    <span class="text-orange-500">
+        Fallback pricing: {{ health.fallback_symbols | join(', ') }}
+    </span>
+    {% endif %}
+</div>
