@@ -470,6 +470,27 @@ def get_portfolio_data_sync(
                 only_missing=True,
             )
 
+        # Final slow pass for any symbols still unresolved after both normal passes.
+        # Uses streaming-only with a longer wait — avoids reqTickers which times out
+        # for certain symbols when IB's delayed data server is slow (common after hours).
+        still_unresolved = [s for s in underlying_symbols if s not in underlying_market_price_map]
+        if still_unresolved:
+            logger.info("Slow-streaming retry for %d persistently unresolved symbols: %s",
+                        len(still_unresolved), still_unresolved)
+            slow_contracts = [Stock(s, 'SMART', 'USD') for s in still_unresolved]
+            slow_tickers = gather_stock_market_data(ib, slow_contracts, wait_seconds=4.0, chunk_size=4)
+            for symbol, ticker in slow_tickers.items():
+                price = pick_price_from_ticker(ticker)
+                if price is not None:
+                    underlying_market_price_map[symbol] = price
+                    underlying_price_source[symbol] = "snapshot"
+                    cache_underlying_price(symbol, price, source="snapshot")
+            for contract in slow_contracts:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    pass
+
         if queued_retry_symbols:
             queued_retry_symbol_set = set(queued_retry_symbols)
             retry_option_contracts = [c for c in option_contracts if c.symbol in queued_retry_symbol_set]

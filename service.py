@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Option delta cache is saved here between service restarts so last-known
 # values survive market close (IB doesn't provide model greeks after hours).
 DELTA_CACHE_FILE = Path("delta_cache.json")
+PRICE_CACHE_FILE = Path("price_cache.json")
 
 
 def _load_delta_cache() -> dict:
@@ -72,6 +73,31 @@ def _save_delta_cache(cache: dict) -> None:
         logger.debug("Delta cache saved (%d entries)", len(entries))
     except Exception as exc:
         logger.warning("Failed to save delta cache: %s", exc)
+
+
+def _load_price_cache() -> dict:
+    """Load persisted underlying price cache ({symbol: price}) from disk."""
+    if not PRICE_CACHE_FILE.exists():
+        return {}
+    try:
+        with PRICE_CACHE_FILE.open() as f:
+            data = json.load(f)
+        result = {sym: float(price) for sym, price in data.items() if isinstance(sym, str)}
+        logger.info("Loaded price cache from disk (%d entries)", len(result))
+        return result
+    except Exception as exc:
+        logger.warning("Failed to load price cache: %s", exc)
+        return {}
+
+
+def _save_price_cache(cache: dict) -> None:
+    """Persist the underlying price cache to disk.  Silently swallows write errors."""
+    try:
+        with PRICE_CACHE_FILE.open("w") as f:
+            json.dump({sym: price for sym, price in cache.items() if isinstance(sym, str)}, f)
+        logger.debug("Price cache saved (%d entries)", len(cache))
+    except Exception as exc:
+        logger.warning("Failed to save price cache: %s", exc)
 
 
 # IB doesn't publish a hard minimum for portfolio snapshot polling.  Pacing
@@ -195,7 +221,7 @@ class IBPollingService:
         # Delta cache is also pre-loaded from disk so last-known values are
         # available immediately — including after a restart during market close.
         self._option_delta_cache: dict = _load_delta_cache()
-        self._underlying_price_cache: dict = {}
+        self._underlying_price_cache: dict = _load_price_cache()
         self._earnings_cache = EarningsCache()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -284,9 +310,11 @@ class IBPollingService:
         )
         as_of = time.time()
 
-        # Persist delta cache so last-known values survive a restart.
+        # Persist caches so last-known values survive a restart.
         if self._option_delta_cache:
             _save_delta_cache(self._option_delta_cache)
+        if self._underlying_price_cache:
+            _save_price_cache(self._underlying_price_cache)
 
         # Trigger a background earnings refresh whenever symbols are known.
         # The cache self-throttles to once per 24 h; this call is cheap.

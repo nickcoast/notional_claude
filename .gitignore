@@ -3,6 +3,7 @@
 options_cache.db
 options_cache.db-journal
 delta_cache.json
+price_cache.json
 
 
 __pycache__/
