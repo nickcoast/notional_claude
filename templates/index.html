@@ -18,6 +18,14 @@
             <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
                 IB Portfolio
             </h1>
+            <div class="flex items-center gap-2">
+                <select id="account-select"
+                        class="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 cursor-pointer">
+                    <option value="ALL">ALL</option>
+                </select>
+                <button id="account-rename" title="Rename selected account"
+                        class="text-sm text-gray-600 hover:text-gray-300 leading-none cursor-pointer hidden">✎</button>
+            </div>
         </div>
 
         <!-- Live content — replaced on each SSE push from /stream-html -->
@@ -79,7 +87,58 @@
                 });
         }
 
-        // Re-apply sort and restore markers after every SSE fragment swap
+        // ── Account selector ──────────────────────────────────────────────────────
+    (function () {
+        var sel = document.getElementById('account-select');
+        var btn = document.getElementById('account-rename');
+
+        function updateRenameBtn() {
+            btn.classList.toggle('hidden', sel.value === 'ALL');
+        }
+
+        function loadAccounts() {
+            fetch('/accounts').then(function (r) { return r.json(); }).then(function (data) {
+                sel.innerHTML = '';
+                data.accounts.forEach(function (acc) {
+                    var opt = document.createElement('option');
+                    opt.value = acc.id;
+                    opt.textContent = acc.name;
+                    if (acc.id === data.selected) opt.selected = true;
+                    sel.appendChild(opt);
+                });
+                updateRenameBtn();
+            }).catch(function () {
+                // /accounts not ready yet (service still connecting) — retry
+                setTimeout(loadAccounts, 2000);
+            });
+        }
+
+        loadAccounts();
+
+        sel.addEventListener('change', function () {
+            fetch('/account', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ account: sel.value }),
+            });
+            updateRenameBtn();
+        });
+
+        btn.addEventListener('click', function () {
+            var id = sel.value;
+            if (id === 'ALL') return;
+            var current = sel.options[sel.selectedIndex].textContent;
+            var entered = window.prompt('Nickname for ' + id + ':', current === id ? '' : current);
+            if (entered === null) return; // cancelled
+            fetch('/account/name', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ account: id, name: entered.trim() }),
+            }).then(loadAccounts);
+        });
+    }());
+
+    // Re-apply sort and restore markers after every SSE fragment swap
         document.body.addEventListener('htmx:afterSwap', applySort);
 
         // Delegate header clicks across swaps

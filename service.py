@@ -31,6 +31,32 @@ logger = logging.getLogger(__name__)
 # values survive market close (IB doesn't provide model greeks after hours).
 DELTA_CACHE_FILE = Path("delta_cache.json")
 PRICE_CACHE_FILE = Path("price_cache.json")
+CONFIG_FILE = Path("config.json")
+
+
+def _load_config() -> dict:
+    """Load config.json; creates it with defaults if missing or unreadable."""
+    defaults = {"account_names": {}, "selected_account": "ALL"}
+    if not CONFIG_FILE.exists():
+        _save_config(defaults)
+        return defaults
+    try:
+        with CONFIG_FILE.open() as f:
+            data = json.load(f)
+        defaults.update(data)
+        return defaults
+    except Exception as exc:
+        logger.warning("Failed to load config: %s", exc)
+        return defaults
+
+
+def _save_config(config: dict) -> None:
+    """Persist config.json. Silently swallows write errors."""
+    try:
+        with CONFIG_FILE.open("w") as f:
+            json.dump(config, f, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save config: %s", exc)
 
 
 def _load_delta_cache() -> dict:
@@ -213,8 +239,10 @@ class IBPollingService:
 
         self._lock = threading.Lock()
         self._snapshot: Optional[dict] = None
+        self._debug: Optional[dict] = None
 
         self._stop_event = threading.Event()
+        self._fetch_now = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
 
         # Survive across poll cycles (mirrors session_state in the Streamlit app).
@@ -223,6 +251,11 @@ class IBPollingService:
         self._option_delta_cache: dict = _load_delta_cache()
         self._underlying_price_cache: dict = _load_price_cache()
         self._earnings_cache = EarningsCache()
+
+        config = _load_config()
+        self._account_names: dict = config.get("account_names", {})
+        self._selected_account: str = config.get("selected_account", "ALL")
+        self._managed_accounts: list = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -253,9 +286,41 @@ class IBPollingService:
         with self._lock:
             return self._snapshot
 
+    def get_debug(self) -> Optional[dict]:
+        with self._lock:
+            return self._debug
+
     def get_health(self) -> Optional[dict]:
         with self._lock:
             return self._snapshot.get("health") if self._snapshot else None
+
+    def get_accounts(self) -> dict:
+        """Return account list and current selection (safe to call from any thread)."""
+        return {
+            "managed": list(self._managed_accounts),
+            "names": dict(self._account_names),
+            "selected": self._selected_account,
+        }
+
+    def set_account(self, account: str) -> None:
+        """Persist and apply a new account selection (safe to call from any thread)."""
+        self._selected_account = account
+        config = _load_config()
+        config["selected_account"] = account
+        _save_config(config)
+        self._fetch_now.set()
+        logger.info("Account selection changed to: %s", account)
+
+    def set_account_name(self, account: str, name: str) -> None:
+        """Set or clear a display name for an account. Persisted to config.json."""
+        config = _load_config()
+        if name:
+            config["account_names"][account] = name
+        else:
+            config["account_names"].pop(account, None)
+        _save_config(config)
+        self._account_names = config.get("account_names", {})
+        logger.info("Account name updated: %s -> %r", account, name)
 
     # ── Background thread ──────────────────────────────────────────────────────
 
@@ -275,7 +340,8 @@ class IBPollingService:
                 self.ib.connect("127.0.0.1", 7497, clientId=client_id, timeout=10)
                 self.ib.reqMarketDataType(portfolio_module.PREFERRED_MARKET_DATA_TYPE)
                 portfolio_module.register_ib_error_handler(self.ib)
-                logger.info("Connected to TWS")
+                self._managed_accounts = list(self.ib.managedAccounts())
+                logger.info("Connected to TWS (accounts: %s)", self._managed_accounts)
                 return
             except Exception as e:
                 attempt += 1
@@ -295,7 +361,8 @@ class IBPollingService:
                         break
 
                 self._fetch_and_store()
-                self._stop_event.wait(timeout=self.poll_interval)
+                self._fetch_now.wait(timeout=self.poll_interval)
+                self._fetch_now.clear()
 
             except Exception as e:
                 logger.error("Poll cycle error: %s", e, exc_info=True)
@@ -303,10 +370,11 @@ class IBPollingService:
                 self._stop_event.wait(timeout=5)
 
     def _fetch_and_store(self):
-        account_df, underlying_df, _, health = portfolio_module.get_portfolio_data_sync(
+        account_df, underlying_df, positions_by_underlying, health = portfolio_module.get_portfolio_data_sync(
             self.ib,
             option_delta_cache=self._option_delta_cache,
             underlying_price_cache=self._underlying_price_cache,
+            account_filter=self._selected_account,
         )
         as_of = time.time()
 
@@ -327,8 +395,33 @@ class IBPollingService:
             earnings=self._earnings_cache.snapshot(),
         )
 
+        debug = None
+        if positions_by_underlying:
+            debug = {
+                "as_of": as_of,
+                "account": self._selected_account,
+                "symbols": {
+                    sym: {
+                        "underlying_price": data.get("underlying_market_price"),
+                        "price_source": data.get("price_source"),
+                        "stock_qty": data.get("stock_count", 0.0),
+                        "options": sorted(
+                            data.get("option_contracts", []),
+                            key=lambda c: (c["expiry"], c["strike"], c["right"]),
+                        ),
+                        "total_delta_shares": data.get("option_notional", 0.0),
+                        "total_notional_value": (
+                            data.get("option_notional", 0.0) * data["underlying_market_price"]
+                            if data.get("underlying_market_price") else None
+                        ),
+                    }
+                    for sym, data in sorted(positions_by_underlying.items())
+                },
+            }
+
         with self._lock:
             self._snapshot = snapshot
+            self._debug = debug
 
         # ── Time-series hook ──────────────────────────────────────────────────
         # When you're ready to persist snapshots, add a call here.

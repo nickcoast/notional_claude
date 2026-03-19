@@ -123,6 +123,7 @@ def get_portfolio_data_sync(
     underlying_price_cache: dict,
     force_retry_now: bool = False,
     auto_retry_enabled: bool = False,
+    account_filter: str = "",
 ):
     """
     Fetch and aggregate portfolio data from IB.
@@ -167,6 +168,12 @@ def get_portfolio_data_sync(
                 note='Empty account summary from IB API',
             )
 
+        # Filter to a single account when requested.
+        _acct = account_filter if account_filter and account_filter != "ALL" else None
+        if _acct:
+            account_summary = [row for row in account_summary if getattr(row, 'account', '') == _acct]
+            logger.info("Account filter applied: %s (%d summary rows)", _acct, len(account_summary))
+
         account_df = pd.DataFrame([(row.tag, row.value) for row in account_summary], columns=['Tag', 'Value'])
         account_df = account_df.set_index('Tag')
 
@@ -174,6 +181,8 @@ def get_portfolio_data_sync(
         t0 = time.time()
         positions = ib.positions() or []
         logger.debug(f"Fetched positions in {time.time() - t0:.2f}s")
+        if _acct:
+            positions = [pos for pos in positions if getattr(pos, 'account', '') == _acct]
         if positions:
             logger.info(f"Got {len(positions)} positions")
         else:
@@ -182,6 +191,8 @@ def get_portfolio_data_sync(
         t0 = time.time()
         portfolio_items = ib.portfolio() or []
         logger.debug(f"Fetched portfolio items in {time.time() - t0:.2f}s")
+        if _acct:
+            portfolio_items = [item for item in portfolio_items if getattr(item, 'account', '') == _acct]
 
         positions_by_underlying = {}
         position_errors = 0
@@ -545,6 +556,7 @@ def get_portfolio_data_sync(
                         'underlying_cost_basis_sum': 0.0,
                         'underlying_cost_basis_qty': 0.0,
                         'price_source': None,
+                        'option_contracts': [],
                     }
 
                 if contract.secType == 'STK':
@@ -614,6 +626,15 @@ def get_portfolio_data_sync(
 
                     option_notional_shares = delta * multiplier * pos.position
                     positions_by_underlying[underlying_symbol]['option_notional'] += option_notional_shares
+                    positions_by_underlying[underlying_symbol]['option_contracts'].append({
+                        'expiry': contract.lastTradeDateOrContractMonth,
+                        'strike': float(contract.strike),
+                        'right': contract.right,
+                        'qty': float(pos.position),
+                        'delta': delta,
+                        'delta_shares': option_notional_shares,
+                        'multiplier': multiplier,
+                    })
 
                     con_id = getattr(contract, 'conId', 0)
                     account = getattr(pos, 'account', '')

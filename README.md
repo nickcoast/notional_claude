@@ -1,42 +1,68 @@
 # Notional Dashboard
 
-## Current App
-- Run with `streamlit run app.py`.
-- Current implementation is a single-file Streamlit app with IBKR API integration.
+Portfolio dashboard for Interactive Brokers, built on FastAPI + HTMX.
+Connects to TWS running locally; no separate auth is needed — the TWS session is the auth gate.
 
-## Why We Are Proceeding With a Re-architecture
-- We need resilient, near-real-time behavior and granular UI updates (cell-level changes), not full-page reruns.
-- Streamlit's rerun execution model makes partial-update UX difficult and can degrade usability under frequent refresh/retry loops.
-- UI logic and IB/data logic are currently tightly coupled, which makes debugging, testing, and failure isolation harder.
-- IB-side conditions (farm degradation, entitlements, intermittent quote gaps) require explicit diagnostics and retry policy controls that are better handled in a dedicated backend service.
+## Starting the app
 
-## Next Steps (Memorialized Plan)
-1. Stabilize current Streamlit baseline
-- Keep existing diagnostics that separate connection failures from quote-level degradation.
-- Keep quote retry queue logic, but only run retries on explicit refresh cycles unless auto-refresh is intentionally enabled.
-- Continue avoiding cache writes from fallback-only price sources (cost basis/unavailable).
+```sh
+./run.sh
+```
 
-2. Extract backend service (first major milestone)
-- Move IB connection/session management and quote/position aggregation into a standalone Python service.
-- Expose:
-  - snapshot endpoints (current portfolio state),
-  - incremental update channel (websocket/pub-sub),
-  - health/diagnostic endpoints (connection, farms, quote quality).
-- Add service-level reconnection/backoff policy and structured logging.
+Then open http://127.0.0.1:8000 in a browser. TWS must already be running and accepting API connections on port 7497 (paper) or 7496 (live).
 
-3. Build real-time UI against backend
-- Replace Streamlit UI for primary dashboard with a frontend that supports efficient incremental updates (target: React + AG Grid).
-- Use backend deltas to patch only changed rows/cells.
-- Keep Streamlit only for ad hoc diagnostics, if still useful.
+The equivalent manual command: `uvicorn api:app --host 127.0.0.1 --port 8000`
 
-4. Cutover and hardening
-- Validate parity between legacy Streamlit calculations and new backend outputs.
-- Add integration tests for quote fallback/retry paths and NPV calculations.
-- Define production runbook (startup order, reconnect behavior, error triage).
+## Configuration
 
-## Success Criteria
-- Dashboard remains interactive while data refreshes.
-- Individual fields update without full-table/whole-page disruption.
-- Connection failures and quote-data failures are clearly distinguished.
-- Quote quality/fallback behavior is observable and auditable.
-- Core portfolio metrics and notional calculations are stable across refreshes.
+Edit `config.json` to set account nicknames (created automatically on first run):
+
+```json
+{
+  "account_names": {
+    "U1234567": "YOLO",
+    "U7654321": "OG"
+  },
+  "selected_account": "ALL"
+}
+```
+
+The active account can also be changed from the dropdown in the dashboard header.
+The selection is saved back to `config.json` automatically.
+
+## Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | Dashboard UI |
+| `GET /snapshot` | Current portfolio snapshot (JSON) |
+| `GET /health` | IB connection and quote-quality diagnostics |
+| `GET /accounts` | Managed accounts with display names |
+| `POST /account` | Set active account filter |
+| `POST /account/name` | Set or clear an account nickname |
+| `GET /debug/positions` | Per-contract position detail for verifying calculations |
+| `GET /stream` | SSE stream of raw JSON snapshots |
+
+## What is calculated vs. from IB
+
+**From IB directly** (`accountSummary`):
+- Net Liquidation, Gross Position Value, Buying Power
+
+**Calculated by the app:**
+- **NGAV** (Notional Gross Asset Value) — per symbol: `stock_value + (Opt δ Shares × underlying_price)`. Options are counted at their delta-equivalent notional, not their market price.
+- **Notional Leverage Ratio** — `NGAV ÷ Net Liquidation`
+- **Standard Leverage Ratio** — `Gross Position Value ÷ Net Liquidation`
+
+## Persistence
+
+| File | Contents |
+|---|---|
+| `config.json` | Account nicknames, selected account |
+| `delta_cache.json` | Last-known option deltas (survives market close) |
+| `price_cache.json` | Last-known underlying prices (reduces cost-basis fallback) |
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `IB_POLL_INTERVAL` | `15` | Seconds between portfolio fetches (minimum 10) |

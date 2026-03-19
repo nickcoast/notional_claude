@@ -1,9 +1,9 @@
 .env
-.vscode
 options_cache.db
 options_cache.db-journal
 delta_cache.json
 price_cache.json
+config.json
 
 
 __pycache__/

@@ -115,9 +115,12 @@
 {# ── Footer ──────────────────────────────────────────────────────────────── #}
 <div class="mt-3 flex items-center justify-between text-xs text-gray-600">
     <span>Updated {{ snapshot.as_of | ts }}</span>
-    {% if health.fallback_symbols %}
-    <span class="text-orange-500">
-        Fallback pricing: {{ health.fallback_symbols | join(', ') }}
-    </span>
-    {% endif %}
+    <div class="flex items-center gap-4">
+        {% if health.fallback_symbols %}
+        <span class="text-orange-500">
+            Fallback pricing: {{ health.fallback_symbols | join(', ') }}
+        </span>
+        {% endif %}
+        <a href="/debug/positions" target="_blank" class="text-gray-700 hover:text-gray-400">debug</a>
+    </div>
 </div>
