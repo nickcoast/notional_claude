@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IB Open Orders</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+    <div class="px-4 py-4 max-w-screen-2xl mx-auto">
+
+        <div class="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
+            <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
+                IB Open Orders
+            </h1>
+            <nav class="flex items-center gap-1 text-xs">
+                <a href="/"
+                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
+                <a href="/orders"
+                   class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">Orders</a>
+            </nav>
+        </div>
+
+        <div hx-ext="sse" sse-connect="/stream-orders-html" sse-swap="message">
+            <div class="text-gray-600 text-sm py-12 text-center">
+                Connecting to order stream…
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+    (function () {
+        let sortCol = null, sortDir = 1;
+
+        function numVal(text) {
+            const n = parseFloat(text.replace(/[$,]/g, ''));
+            return isNaN(n) ? null : n;
+        }
+
+        function cmp(a, b) {
+            if (a === null && b === null) return 0;
+            if (a === null) return 1;
+            if (b === null) return -1;
+            return a < b ? -sortDir : a > b ? sortDir : 0;
+        }
+
+        function applySort() {
+            if (sortCol === null) return;
+            const table = document.querySelector('table[data-sortable]');
+            if (!table) return;
+            const tbody = table.querySelector('tbody');
+            const th = table.querySelectorAll('thead th')[sortCol];
+            const isNum = th && th.dataset.sortType === 'number';
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            rows.sort(function (a, b) {
+                const rawA = (a.cells[sortCol] || {}).textContent || '';
+                const rawB = (b.cells[sortCol] || {}).textContent || '';
+                const va = isNum ? numVal(rawA.trim()) : rawA.trim().toLowerCase();
+                const vb = isNum ? numVal(rawB.trim()) : rawB.trim().toLowerCase();
+                return cmp(va, vb);
+            });
+            rows.forEach(function (r) { tbody.appendChild(r); });
+            updateMarkers(table);
+        }
+
+        function updateMarkers(table) {
+            (table || document.querySelector('table[data-sortable]'))
+                .querySelectorAll('thead th .sort-marker')
+                .forEach(function (m, i) {
+                    m.textContent = i === sortCol
+                        ? (sortDir > 0 ? ' ↑' : ' ↓')
+                        : ' ↕';
+                });
+        }
+
+        document.body.addEventListener('htmx:afterSwap', applySort);
+        document.body.addEventListener('click', function (e) {
+            var th = e.target.closest('table[data-sortable] thead th');
+            if (!th) return;
+            var ths = Array.from(th.closest('tr').querySelectorAll('th'));
+            var col = ths.indexOf(th);
+            if (sortCol === col) {
+                sortDir = -sortDir;
+            } else {
+                sortCol = col;
+                sortDir = 1;
+            }
+            applySort();
+        });
+    }());
+    </script>
+</body>
+</html>

@@ -142,6 +142,7 @@ def _serialize_snapshot(
     health: dict,
     as_of: float,
     earnings: Optional[dict] = None,
+    open_orders: Optional[list[dict]] = None,
 ) -> dict:
     """
     Convert portfolio DataFrames to a JSON-serializable snapshot dict.
@@ -210,10 +211,30 @@ def _serialize_snapshot(
 
             positions.append(entry)
 
+    orders = []
+    for order in open_orders or []:
+        entry = dict(order)
+        sym = entry.get("symbol", "")
+        edate_str = earnings.get(sym)
+        if edate_str:
+            try:
+                edate = date.fromisoformat(edate_str)
+                edays = (edate - today).days
+                entry["earnings_date"] = edate_str
+                entry["earnings_days"] = edays if edays >= 0 else None
+            except ValueError:
+                entry["earnings_date"] = None
+                entry["earnings_days"] = None
+        else:
+            entry["earnings_date"] = None
+            entry["earnings_days"] = None
+        orders.append(entry)
+
     return {
         "as_of":     as_of,
         "metrics":   metrics,
         "positions": positions,
+        "orders":    orders,
         "health":    health or {},
     }
 
@@ -298,6 +319,16 @@ class IBPollingService:
         with self._lock:
             return self._snapshot.get("health") if self._snapshot else None
 
+    def get_orders(self) -> Optional[dict]:
+        with self._lock:
+            if self._snapshot is None:
+                return None
+            return {
+                "as_of": self._snapshot.get("as_of"),
+                "orders": list(self._snapshot.get("orders", [])),
+                "health": dict(self._snapshot.get("health", {})),
+            }
+
     def get_accounts(self) -> dict:
         """Return account list and current selection (safe to call from any thread)."""
         return {
@@ -380,6 +411,7 @@ class IBPollingService:
             underlying_price_cache=self._underlying_price_cache,
             account_filter=self._selected_account,
         )
+        open_orders = self._fetch_open_orders()
         as_of = time.time()
 
         # Persist caches so last-known values survive a restart.
@@ -392,11 +424,15 @@ class IBPollingService:
         # The cache self-throttles to once per 24 h; this call is cheap.
         if underlying_df is not None and not underlying_df.empty:
             symbols = underlying_df["Symbol"].dropna().unique().tolist()
-            self._earnings_cache.refresh_if_stale(symbols)
+        else:
+            symbols = []
+        order_symbols = [order.get("symbol") for order in open_orders if order.get("symbol")]
+        self._earnings_cache.refresh_if_stale(sorted(set(symbols + order_symbols)))
 
         snapshot = _serialize_snapshot(
             account_df, underlying_df, health, as_of,
             earnings=self._earnings_cache.snapshot(),
+            open_orders=open_orders,
         )
 
         debug = None
@@ -435,3 +471,55 @@ class IBPollingService:
         #     db.insert_snapshot(snapshot)
         #
         logger.debug("Snapshot stored (as_of=%.1f, positions=%d)", as_of, len(snapshot["positions"]))
+
+    def _fetch_open_orders(self) -> list[dict]:
+        """Fetch and normalize open IB orders without trading side effects."""
+        if not self.ib.isConnected():
+            return []
+
+        trades = []
+        for label, getter in (
+            ("all open orders", self.ib.reqAllOpenOrders),
+            ("client open orders", self.ib.reqOpenOrders),
+            ("local open trades", self.ib.openTrades),
+        ):
+            try:
+                trades.extend(getter() or [])
+            except Exception as exc:
+                logger.warning("Failed to fetch %s: %s", label, exc)
+
+        unique = {}
+        for item in trades:
+            order = getattr(item, "order", item)
+            contract = getattr(item, "contract", None)
+            status = getattr(item, "orderStatus", None)
+            order_id = getattr(order, "orderId", None)
+            perm_id = getattr(order, "permId", None)
+            con_id = getattr(contract, "conId", None) if contract else None
+            unique[(perm_id, order_id, con_id)] = (contract, order, status)
+
+        orders = []
+        for contract, order, status in unique.values():
+            orders.append({
+                "symbol": getattr(contract, "symbol", "") if contract else "",
+                "local_symbol": getattr(contract, "localSymbol", "") if contract else "",
+                "security_type": getattr(contract, "secType", "") if contract else "",
+                "action": getattr(order, "action", ""),
+                "order_type": getattr(order, "orderType", ""),
+                "total_quantity": safe_float_conversion(getattr(order, "totalQuantity", 0)),
+                "limit_price": safe_float_conversion(getattr(order, "lmtPrice", 0)),
+                "aux_price": safe_float_conversion(getattr(order, "auxPrice", 0)),
+                "time_in_force": getattr(order, "tif", ""),
+                "status": getattr(status, "status", ""),
+                "filled": safe_float_conversion(getattr(status, "filled", 0)),
+                "remaining": safe_float_conversion(getattr(status, "remaining", 0)),
+                "account": getattr(order, "account", ""),
+                "exchange": getattr(contract, "exchange", "") if contract else "",
+                "currency": getattr(contract, "currency", "") if contract else "",
+                "order_id": int(safe_float_conversion(getattr(order, "orderId", 0))),
+                "perm_id": int(safe_float_conversion(getattr(order, "permId", 0))),
+                "parent_id": int(safe_float_conversion(getattr(order, "parentId", 0))),
+            })
+
+        orders.sort(key=lambda item: (item.get("symbol") or "", item.get("order_id") or 0))
+        return orders

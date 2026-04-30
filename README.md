@@ -35,13 +35,22 @@ The selection is saved back to `config.json` automatically.
 | Endpoint | Description |
 |---|---|
 | `GET /` | Dashboard UI |
+| `GET /orders` | Read-only open orders UI |
 | `GET /snapshot` | Current portfolio snapshot (JSON) |
+| `GET /orders.json` | Current open orders snapshot (JSON) |
 | `GET /health` | IB connection and quote-quality diagnostics |
 | `GET /accounts` | Managed accounts with display names |
 | `POST /account` | Set active account filter |
 | `POST /account/name` | Set or clear an account nickname |
 | `GET /debug/positions` | Per-contract position detail for verifying calculations |
 | `GET /stream` | SSE stream of raw JSON snapshots |
+
+The orders page is display-only. It reads open orders from `ib_insync`
+(`reqAllOpenOrders`, `reqOpenOrders`, and local `openTrades`) and does not
+submit, modify, or cancel trades.
+
+Portfolio and order symbols use the same earnings-date highlighting: red within
+3 days, orange within 7 days, and amber within 30 days.
 
 ## What is calculated vs. from IB
 

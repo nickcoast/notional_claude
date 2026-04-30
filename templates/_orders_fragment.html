@@ -1,0 +1,81 @@
+{%- set health = snapshot.health -%}
+
+{% if not health.connection_ok %}
+<div class="mb-4 px-3 py-2 rounded text-xs bg-red-950 border border-red-800 text-red-300">
+    ✗ Not connected to TWS{% if health.note %}: {{ health.note }}{% endif %}
+</div>
+{% elif health.quote_issue_count > 0 or health.farm_down_count > 0 %}
+<div class="mb-4 px-3 py-2 rounded text-xs bg-yellow-950 border border-yellow-800 text-yellow-300">
+    ⚠ Connected — quote degradation: {{ health.quote_issue_count }} quote issue(s),
+    {{ health.farm_down_count }} farm(s) down
+    {%- if health.farm_down_names %} · farms: {{ health.farm_down_names | join(', ') }}{% endif %}
+</div>
+{% endif %}
+
+{% if snapshot.orders %}
+<div class="overflow-x-auto">
+    <table class="w-full text-xs border-collapse" data-sortable>
+        <thead>
+            <tr class="text-gray-500 border-b border-gray-700">
+                <th class="text-left py-2 pr-4 font-medium cursor-pointer select-none">Symbol<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">Contract<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">Action<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">Type<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Qty<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Limit<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Aux<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">TIF<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">Status<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Filled<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Remaining<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-left py-2 pl-4 font-medium cursor-pointer select-none">Account<span class="sort-marker text-gray-700"> ↕</span></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for order in snapshot.orders | sort(attribute='symbol') %}
+            <tr class="border-b border-gray-800/60 hover:bg-gray-800/30">
+                <td class="py-1.5 pr-4 text-left font-bold text-white
+                    {%- if order.earnings_days is not none -%}
+                        {%- if order.earnings_days <= 3 %} bg-red-900/70
+                        {%- elif order.earnings_days <= 7 %} bg-orange-900/60
+                        {%- elif order.earnings_days <= 30 %} bg-amber-900/30
+                        {%- endif -%}
+                    {%- endif %}"
+                    {%- if order.earnings_date %} title="Earnings: {{ order.earnings_date }} (in {{ order.earnings_days }} day{{ 's' if order.earnings_days != 1 else '' }})"{% endif %}>
+                    {{ order.symbol or '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-left text-gray-300">
+                    {{ order.local_symbol or order.security_type or '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-left font-semibold
+                    {{ 'text-emerald-400' if order.action == 'BUY' else 'text-red-400' if order.action == 'SELL' else 'text-gray-300' }}">
+                    {{ order.action or '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-left text-gray-300">{{ order.order_type or '—' }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">{{ order.total_quantity | number(2) }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
+                    {{ order.limit_price | currency if order.limit_price else '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
+                    {{ order.aux_price | currency if order.aux_price else '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-left text-gray-300">{{ order.time_in_force or '—' }}</td>
+                <td class="py-1.5 px-2 text-left text-gray-300">{{ order.status or '—' }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">{{ order.filled | number(2) }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">{{ order.remaining | number(2) }}</td>
+                <td class="py-1.5 pl-4 text-left text-gray-500">{{ order.account or '—' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="py-12 text-center text-sm text-gray-600">
+    No open orders returned by IB.
+</div>
+{% endif %}
+
+<div class="mt-3 flex items-center justify-between text-xs text-gray-600">
+    <span>Updated {{ snapshot.as_of | ts }}</span>
+    <span>Read-only view: this app does not submit, modify, or cancel trades.</span>
+</div>

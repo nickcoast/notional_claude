@@ -103,6 +103,11 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+@app.get("/orders")
+async def orders_page(request: Request):
+    return templates.TemplateResponse("orders.html", {"request": request})
+
+
 @app.get("/debug/positions", response_class=HTMLResponse)
 async def debug_positions():
     """Per-contract position detail for verifying delta and notional calculations."""
@@ -228,6 +233,39 @@ async def stream_html():
     )
 
 
+@app.get("/stream-orders-html")
+async def stream_orders_html():
+    """SSE stream that pushes rendered open-order table fragments."""
+    async def event_generator():
+        last_as_of = 0.0
+        while True:
+            try:
+                orders = service.get_orders()
+                if orders is not None:
+                    as_of = orders.get("as_of", 0.0)
+                    if as_of > last_as_of:
+                        last_as_of = as_of
+                        html = templates.get_template("_orders_fragment.html").render(snapshot=orders)
+                        lines = html.split("\n")
+                        data = "\n".join(f"data: {line}" for line in lines)
+                        yield f"{data}\n\n"
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("stream-orders-html error: %s", e)
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ── JSON endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/snapshot")
@@ -249,6 +287,18 @@ async def health():
     if h is None:
         return JSONResponse({"error": "No health data yet"}, status_code=503)
     return h
+
+
+@app.get("/orders.json")
+async def orders_json():
+    """Current read-only open orders snapshot."""
+    data = service.get_orders()
+    if data is None:
+        return JSONResponse(
+            {"error": "Initial fetch in progress — try again in a few seconds"},
+            status_code=503,
+        )
+    return data
 
 
 @app.get("/accounts")
