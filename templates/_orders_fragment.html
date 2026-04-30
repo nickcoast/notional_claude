@@ -24,6 +24,8 @@
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Qty<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Limit<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Aux<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Current<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Away<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">TIF<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-left py-2 px-2 font-medium cursor-pointer select-none">Status<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none" data-sort-type="number">Filled<span class="sort-marker text-gray-700"> ↕</span></th>
@@ -58,6 +60,14 @@
                 </td>
                 <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">
                     {{ order.aux_price | currency if order.aux_price else '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300"
+                    {%- if order.order_price and order.current_price %} title="Compared {{ order.order_price | currency }} order price to {{ order.current_price | currency }} current price"{% endif %}>
+                    {{ order.current_price | currency if order.current_price else '—' }}
+                </td>
+                <td class="py-1.5 px-2 text-right tabular-nums font-semibold
+                    {{ 'text-emerald-400' if order.price_distance_pct is not none and order.price_distance_pct <= 5 else 'text-orange-400' if order.price_distance_pct is not none and order.price_distance_pct <= 25 else 'text-red-400' if order.price_distance_pct is not none else 'text-gray-500' }}">
+                    {{ (order.price_distance_pct | number(2)) ~ '%' if order.price_distance_pct is not none else '—' }}
                 </td>
                 <td class="py-1.5 px-2 text-left text-gray-300">{{ order.time_in_force or '—' }}</td>
                 <td class="py-1.5 px-2 text-left text-gray-300">{{ order.status or '—' }}</td>

@@ -49,6 +49,10 @@ The orders page is display-only. It reads open orders from `ib_insync`
 (`reqAllOpenOrders`, `reqOpenOrders`, and local `openTrades`) and does not
 submit, modify, or cancel trades.
 
+Open-order rows include a calculated `Away` percentage: the absolute distance
+between the actionable order price and current market reference price. Stock
+orders use last trade when available; option orders prefer the bid/ask midpoint.
+
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days.
 

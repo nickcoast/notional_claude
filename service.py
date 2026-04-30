@@ -17,6 +17,7 @@ from ib_insync import IB
 
 import portfolio as portfolio_module
 from earnings import EarningsCache
+from market_data import pick_price_from_ticker
 from utils import (
     configure_locale,
     get_account_value,
@@ -522,4 +523,81 @@ class IBPollingService:
             })
 
         orders.sort(key=lambda item: (item.get("symbol") or "", item.get("order_id") or 0))
+        self._annotate_order_price_distance(orders, unique.values())
         return orders
+
+    def _annotate_order_price_distance(self, orders: list[dict], order_items) -> None:
+        """Add current/reference prices and absolute percent distance to orders."""
+        contract_by_key = {}
+        for contract, order, _status in order_items:
+            if contract is None:
+                continue
+            key = (
+                int(safe_float_conversion(getattr(order, "permId", 0))),
+                int(safe_float_conversion(getattr(order, "orderId", 0))),
+            )
+            contract_by_key[key] = contract
+
+        active = []
+        for order in orders:
+            order_price = self._order_comparison_price(order)
+            order["order_price"] = order_price
+            order["current_price"] = None
+            order["price_distance_pct"] = None
+            contract = contract_by_key.get((order.get("perm_id"), order.get("order_id")))
+            if contract is None or not (is_valid_number(order_price) and float(order_price) > 0):
+                continue
+            try:
+                ticker = self.ib.reqMktData(contract)
+                active.append((order, contract, ticker))
+            except Exception as exc:
+                logger.debug("Failed to request order market data for %s: %s", order.get("symbol"), exc)
+
+        if active:
+            try:
+                self.ib.sleep(0.8)
+            except Exception as exc:
+                logger.debug("Order market data wait failed: %s", exc)
+
+        for order, contract, ticker in active:
+            current_price = self._order_current_price(contract, ticker)
+            if is_valid_number(current_price) and float(current_price) > 0:
+                current_price = float(current_price)
+                order_price = float(order["order_price"])
+                order["current_price"] = current_price
+                order["price_distance_pct"] = abs(order_price - current_price) / current_price * 100.0
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _order_comparison_price(order: dict) -> Optional[float]:
+        order_type = (order.get("order_type") or "").upper()
+        limit_price = safe_float_conversion(order.get("limit_price"))
+        aux_price = safe_float_conversion(order.get("aux_price"))
+
+        # Stop-style orders become actionable at the stop/trigger price.
+        if ("STP" in order_type or "STOP" in order_type) and aux_price > 0:
+            return aux_price
+        if limit_price > 0:
+            return limit_price
+        if aux_price > 0:
+            return aux_price
+        return None
+
+    @staticmethod
+    def _order_current_price(contract, ticker) -> Optional[float]:
+        sec_type = getattr(contract, "secType", "")
+        if sec_type == "OPT":
+            if is_valid_number(getattr(ticker, "bid", None)) and is_valid_number(getattr(ticker, "ask", None)):
+                bid = float(ticker.bid)
+                ask = float(ticker.ask)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+        elif sec_type == "STK":
+            last = getattr(ticker, "last", None)
+            if is_valid_number(last) and float(last) > 0:
+                return float(last)
+
+        return pick_price_from_ticker(ticker)
