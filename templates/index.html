@@ -138,6 +138,66 @@
         });
     }());
 
+    // ── Secondary metrics row collapse ────────────────────────────────────────
+    (function () {
+        function isOpen() {
+            return localStorage.getItem('secondaryMetrics') === 'open';
+        }
+
+        function apply() {
+            var open = isOpen();
+            var row = document.getElementById('secondary-metrics');
+            var btn = document.getElementById('secondary-metrics-toggle');
+            if (!row || !btn) return;
+            row.classList.toggle('hidden', !open);
+            row.classList.toggle('grid', open);
+            btn.textContent = open ? '▾ less' : '▸ more';
+        }
+
+        document.body.addEventListener('click', function (e) {
+            var btn = e.target.closest('#secondary-metrics-toggle');
+            if (!btn) return;
+            localStorage.setItem('secondaryMetrics', isOpen() ? 'closed' : 'open');
+            apply();
+        });
+
+        document.body.addEventListener('htmx:afterSwap', apply);
+        apply();
+    }());
+
+    // ── Notional mode toggle (gross / net) ────────────────────────────────────
+    (function () {
+        var mode = localStorage.getItem('notionalMode') || 'gross';
+
+        function apply() {
+            var isGross = mode === 'gross';
+            ['ngav-gross', 'nleg-gross'].forEach(function (cls) {
+                document.querySelectorAll('.' + cls).forEach(function (el) {
+                    el.classList.toggle('hidden', !isGross);
+                });
+            });
+            ['ngav-net', 'nleg-net'].forEach(function (cls) {
+                document.querySelectorAll('.' + cls).forEach(function (el) {
+                    el.classList.toggle('hidden', isGross);
+                });
+            });
+            document.querySelectorAll('.notional-toggle').forEach(function (el) {
+                el.textContent = '[' + mode + ']';
+            });
+        }
+
+        document.body.addEventListener('click', function (e) {
+            if (e.target.classList.contains('notional-toggle')) {
+                mode = mode === 'gross' ? 'net' : 'gross';
+                localStorage.setItem('notionalMode', mode);
+                apply();
+            }
+        });
+
+        document.body.addEventListener('htmx:afterSwap', apply);
+        apply();
+    }());
+
     // Re-apply sort and restore markers after every SSE fragment swap
         document.body.addEventListener('htmx:afterSwap', applySort);
 

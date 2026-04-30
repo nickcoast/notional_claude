@@ -75,7 +75,22 @@ def option_delta_from_ticker(ticker):
     return None
 
 
-_RISK_FREE_RATE = 0.05  # used only when IB doesn't supply delta directly
+def option_theta_from_ticker(ticker):
+    """Pick the best available theta (daily $ decay per share) from IB option greek fields."""
+    if ticker is None:
+        return None
+
+    for greek_field in ("modelGreeks", "bidGreeks", "askGreeks", "lastGreeks"):
+        greeks = getattr(ticker, greek_field, None)
+        if not greeks:
+            continue
+        theta = getattr(greeks, "theta", None)
+        if is_valid_number(theta):
+            return float(theta)
+    return None
+
+
+_RISK_FREE_RATE = 0.05  # used only when IB doesn't supply greeks directly
 
 
 def _phi(x: float) -> float:
@@ -83,13 +98,15 @@ def _phi(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def option_delta_bs_fallback(ticker, strike: float, expiry_str: str, right: str):
-    """
-    Compute Black-Scholes delta when IB returns NaN for it but does supply
-    undPrice and impliedVol in the greeks object (common with delayed/frozen
-    market data type 3).
+def _phi_pdf(x: float) -> float:
+    """Standard normal PDF."""
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-    Returns a float in [-1, 1] or None if insufficient inputs.
+
+def _bs_inputs(ticker, strike: float, expiry_str: str):
+    """
+    Extract (und_price, impl_vol, T, d1, d2) from a ticker for BS calculations.
+    Returns None if any required input is missing or T <= 0.
     """
     und_price = None
     impl_vol = None
@@ -111,7 +128,6 @@ def option_delta_bs_fallback(ticker, strike: float, expiry_str: str, right: str)
     if und_price is None or impl_vol is None:
         return None
 
-    # Parse expiry string (YYYYMMDD or YYYYMM)
     try:
         fmt = "%Y%m%d" if len(expiry_str) == 8 else "%Y%m"
         expiry_date = datetime.strptime(expiry_str, fmt).date()
@@ -126,13 +142,52 @@ def option_delta_bs_fallback(ticker, strike: float, expiry_str: str, right: str)
         d1 = (math.log(und_price / strike) + (_RISK_FREE_RATE + 0.5 * impl_vol ** 2) * T) / (
             impl_vol * math.sqrt(T)
         )
+        d2 = d1 - impl_vol * math.sqrt(T)
     except (ValueError, ZeroDivisionError):
         return None
 
+    return und_price, impl_vol, T, d1, d2
+
+
+def option_delta_bs_fallback(ticker, strike: float, expiry_str: str, right: str):
+    """
+    Compute Black-Scholes delta when IB returns NaN for it but does supply
+    undPrice and impliedVol in the greeks object (common with delayed/frozen
+    market data type 3).
+
+    Returns a float in [-1, 1] or None if insufficient inputs.
+    """
+    inputs = _bs_inputs(ticker, strike, expiry_str)
+    if inputs is None:
+        return None
+    _und, _vol, _T, d1, _d2 = inputs
     if right.upper() in ("C", "CALL"):
         return _phi(d1)
     else:
         return _phi(d1) - 1.0
+
+
+def option_theta_bs_fallback(ticker, strike: float, expiry_str: str, right: str):
+    """
+    Compute daily Black-Scholes theta ($ per share per day) when IB doesn't
+    supply it.  Uses the same undPrice + impliedVol inputs as the delta fallback.
+
+    Returns a float or None if insufficient inputs.
+    """
+    inputs = _bs_inputs(ticker, strike, expiry_str)
+    if inputs is None:
+        return None
+    und_price, impl_vol, T, d1, d2 = inputs
+
+    decay = -und_price * _phi_pdf(d1) * impl_vol / (2.0 * math.sqrt(T))
+    r = _RISK_FREE_RATE
+    K = strike
+    if right.upper() in ("C", "CALL"):
+        theta = decay - r * K * math.exp(-r * T) * _phi(d2)
+    else:
+        theta = decay + r * K * math.exp(-r * T) * _phi(-d2)
+
+    return theta / 365.0  # convert annual to daily
 
 
 def option_underlying_price_from_ticker(ticker):

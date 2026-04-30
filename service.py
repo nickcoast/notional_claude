@@ -155,8 +155,12 @@ def _serialize_snapshot(
         metrics = {
             "net_liquidation":        get_account_value(account_df, "NetLiquidation",                       numeric=True, default=0.0),
             "gross_position_value":   get_account_value(account_df, "GrossPositionValue",                   numeric=True, default=0.0),
-            "ngav":                   get_account_value(account_df, "NGAV (Notional Gross Asset Value)",     numeric=True, default=0.0),
-            "notional_leverage_ratio": safe_float_conversion(get_account_value(account_df, "NLR (Notional Leverage Ratio)")),
+            "sma":                    get_account_value(account_df, "SMA",                                  numeric=True, default=0.0),
+            "portfolio_theta":        safe_float_conversion(get_account_value(account_df, "Portfolio Theta")),
+            "ngav":                          get_account_value(account_df, "NGAV (Notional Gross Asset Value)", numeric=True, default=0.0),
+            "ngav_gross":                    get_account_value(account_df, "NGAV Gross",                        numeric=True, default=0.0),
+            "notional_leverage_ratio":       safe_float_conversion(get_account_value(account_df, "NLR (Notional Leverage Ratio)")),
+            "gross_notional_leverage_ratio": safe_float_conversion(get_account_value(account_df, "Gross Notional Leverage Ratio")),
             "standard_leverage_ratio": safe_float_conversion(get_account_value(account_df, "Standard Leverage Ratio")),
             "buying_power":           get_account_value(account_df, "BuyingPower",                          numeric=True, default=0.0),
         }

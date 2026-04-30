@@ -16,25 +16,109 @@
 
 {# ── Metrics row ─────────────────────────────────────────────────────────── #}
 <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 mb-5">
-    {% for label, value, is_ratio in [
-        ('Net Liquidation',    m.net_liquidation,         false),
-        ('Gross Position',     m.gross_position_value,    false),
-        ('NGAV',               m.ngav,                    false),
-        ('Std Leverage',       m.standard_leverage_ratio, true),
-        ('Notional Leverage',  m.notional_leverage_ratio, true),
-        ('Buying Power',       m.buying_power,            false),
-    ] %}
-    <div class="bg-gray-800 rounded px-3 py-2">
-        <div class="text-xs text-gray-500 mb-1">{{ label }}</div>
+
+    {# Net Liquidation — IB #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="From IB accountSummary — total portfolio value if all positions were liquidated">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Net Liquidation</span>
+            <span class="text-[9px] text-blue-600">ib</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums">{{ m.net_liquidation | currency }}</div>
+    </div>
+
+    {# Gross Position — IB #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="From IB accountSummary — sum of absolute market values of all positions">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Gross Position</span>
+            <span class="text-[9px] text-blue-600">ib</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums">{{ m.gross_position_value | currency }}</div>
+    </div>
+
+    {# Std Leverage — calc, adjacent to Gross Position #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="Calculated — Gross Position Value ÷ Net Liquidation">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Std Leverage</span>
+            <span class="text-[9px] text-teal-700">calc</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums">{{ m.standard_leverage_ratio | number(2) }}×</div>
+    </div>
+
+    {# NGAV — calc, gross/net toggle #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="Calculated — Gross: abs(stock) + abs(opt Δ notional) per symbol, all exposure positive. Net: signed, so hedges (long puts, short stock) reduce it.">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">NGAV</span>
+            <span class="text-[9px] text-teal-700">calc</span>
+            <button class="notional-toggle ml-auto text-[9px] text-gray-400 hover:text-white border border-gray-600 hover:border-gray-400 rounded px-1 cursor-pointer select-none leading-tight"></button>
+        </div>
         <div class="text-sm font-semibold tabular-nums">
-            {%- if is_ratio -%}
-                {{ value | number(2) }}×
-            {%- else -%}
-                {{ value | currency }}
-            {%- endif -%}
+            <span class="ngav-gross">{{ m.ngav_gross | currency }}</span>
+            <span class="ngav-net hidden">{{ m.ngav | currency }}</span>
         </div>
     </div>
-    {% endfor %}
+
+    {# Notional Leverage — calc, gross/net toggle, adjacent to NGAV #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="Calculated — NGAV ÷ Net Liquidation (gross or net depending on toggle)">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Notional Lev</span>
+            <span class="text-[9px] text-teal-700">calc</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums">
+            <span class="nleg-gross">{{ m.gross_notional_leverage_ratio | number(2) }}×</span>
+            <span class="nleg-net hidden">{{ m.notional_leverage_ratio | number(2) }}×</span>
+        </div>
+    </div>
+
+    {# Buying Power — IB #}
+    <div class="bg-gray-800 rounded px-3 py-2 cursor-help"
+         title="From IB accountSummary — available capital for new positions">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Buying Power</span>
+            <span class="text-[9px] text-blue-600">ib</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums">{{ m.buying_power | currency }}</div>
+    </div>
+
+</div>
+
+{# ── Secondary metrics row (collapsible) ─────────────────────────────────── #}
+<div class="flex items-center gap-2 mb-2 -mt-1">
+    <button id="secondary-metrics-toggle"
+            class="text-xs text-gray-400 hover:text-gray-100 cursor-pointer select-none">▸ more</button>
+</div>
+<div id="secondary-metrics" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-2 mb-5">
+
+    {# Portfolio Theta — calc #}
+    <div class="bg-gray-900 border border-gray-800 rounded px-3 py-2 cursor-help"
+         title="Calculated — sum of (theta × qty × multiplier) across all option positions. Theta is daily dollar decay per share from IB modelGreeks.">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">Portfolio Theta</span>
+            <span class="text-[9px] text-teal-700">calc</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums
+            {{ 'text-emerald-400' if m.portfolio_theta and m.portfolio_theta > 0 else 'text-red-400' if m.portfolio_theta and m.portfolio_theta < 0 else '' }}">
+            {{ m.portfolio_theta | number(2) if m.portfolio_theta is not none else '—' }}
+        </div>
+    </div>
+
+    {# SMA — IB #}
+    <div class="bg-gray-900 border border-gray-800 rounded px-3 py-2 cursor-help"
+         title="From IB accountSummary — Special Memorandum Account balance (Reg T margin surplus). Positive means excess margin; negative means a margin call is possible.">
+        <div class="text-xs mb-1 flex items-baseline gap-1">
+            <span class="text-gray-300">SMA</span>
+            <span class="text-[9px] text-blue-600">ib</span>
+        </div>
+        <div class="text-sm font-semibold tabular-nums
+            {{ 'text-red-400' if m.sma and m.sma < 0 else '' }}">
+            {{ m.sma | currency }}
+        </div>
+    </div>
+
 </div>
 
 {# ── Positions table ─────────────────────────────────────────────────────── #}
@@ -46,7 +130,7 @@
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Mkt Price<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Shares<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Stock Value<span class="sort-marker text-gray-700"> ↕</span></th>
-                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Opt δ Shares<span class="sort-marker text-gray-700"> ↕</span></th>
+                <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Opt Δ Shares<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Opt Notional<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">Opt Actual<span class="sort-marker text-gray-700"> ↕</span></th>
                 <th class="text-right py-2 px-2 font-medium cursor-pointer select-none">NPV<span class="sort-marker text-gray-700"> ↕</span></th>

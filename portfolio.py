@@ -13,6 +13,8 @@ from market_data import (
     option_contract_key,
     option_delta_bs_fallback,
     option_delta_from_ticker,
+    option_theta_bs_fallback,
+    option_theta_from_ticker,
     option_underlying_price_from_ticker,
     pick_price_from_ticker,
 )
@@ -325,6 +327,8 @@ def get_portfolio_data_sync(
 
         # Pull option deltas/quotes and feed underlying prices from option greeks.
         option_delta_map = {}
+        option_theta_map = {}
+        total_portfolio_theta = 0.0
         option_price_map = {}
         option_keys_with_delta = set()
         option_keys_with_und_price = set()
@@ -342,6 +346,13 @@ def get_portfolio_data_sync(
                     option_delta_map[key] = float(delta)
                     cache_option_delta(key, delta)
                     option_keys_with_delta.add(key)
+
+                theta = option_theta_from_ticker(ticker)
+                if not is_valid_number(theta):
+                    _sym, expiry_str, strike, right = key[0], key[1], key[2], key[3]
+                    theta = option_theta_bs_fallback(ticker, strike, expiry_str, right)
+                if is_valid_number(theta):
+                    option_theta_map[key] = float(theta)
 
                 option_price = pick_price_from_ticker(ticker)
                 if option_price is not None:
@@ -626,6 +637,10 @@ def get_portfolio_data_sync(
 
                     option_notional_shares = delta * multiplier * pos.position
                     positions_by_underlying[underlying_symbol]['option_notional'] += option_notional_shares
+
+                    theta = option_theta_map.get(key)
+                    if is_valid_number(theta):
+                        total_portfolio_theta += float(theta) * multiplier * float(pos.position)
                     positions_by_underlying[underlying_symbol]['option_contracts'].append({
                         'expiry': contract.lastTradeDateOrContractMonth,
                         'strike': float(contract.strike),
@@ -669,6 +684,7 @@ def get_portfolio_data_sync(
         logger.info("Creating dataframe...")
         underlying_data = []
         total_npv = 0.0
+        total_gross_npv = 0.0
 
         for symbol, data in positions_by_underlying.items():
             try:
@@ -704,6 +720,7 @@ def get_portfolio_data_sync(
 
                 option_notional_value = data['option_notional'] * market_price
                 total_notional = data['stock_value'] + option_notional_value
+                gross_total_notional = abs(data['stock_value']) + abs(option_notional_value)
 
                 underlying_data.append({
                     'Symbol': symbol,
@@ -718,6 +735,7 @@ def get_portfolio_data_sync(
                     'Notional Position Value (NPV)': total_notional
                 })
                 total_npv += total_notional
+                total_gross_npv += gross_total_notional
             except Exception as calc_error:
                 logger.warning(f"Error calculating values for {symbol}: {calc_error}")
                 continue
@@ -824,12 +842,18 @@ def get_portfolio_data_sync(
         gross_pos_val = get_account_value(account_df, 'GrossPositionValue', numeric=True, default=0.0)
         if not is_valid_number(total_npv):
             total_npv = 0.0
+        if not is_valid_number(total_gross_npv):
+            total_gross_npv = 0.0
 
         notional_leverage_ratio = total_npv / nlv if nlv > 0 else 0
+        gross_notional_leverage_ratio = total_gross_npv / nlv if nlv > 0 else 0
         standard_leverage_ratio = gross_pos_val / nlv if nlv > 0 else 0
 
+        account_df.loc['Portfolio Theta', 'Value'] = f"{total_portfolio_theta:.2f}"
         account_df.loc['NGAV (Notional Gross Asset Value)', 'Value'] = format_currency(total_npv)
+        account_df.loc['NGAV Gross', 'Value'] = format_currency(total_gross_npv)
         account_df.loc['NLR (Notional Leverage Ratio)', 'Value'] = f"{notional_leverage_ratio:.2f}"
+        account_df.loc['Gross Notional Leverage Ratio', 'Value'] = f"{gross_notional_leverage_ratio:.2f}"
         account_df.loc['Standard Leverage Ratio', 'Value'] = f"{standard_leverage_ratio:.2f}"
 
         logger.info("Metrics calculated successfully")
