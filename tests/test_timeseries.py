@@ -125,8 +125,12 @@ class TimeSeriesStoreTest(unittest.TestCase):
             fixture["snapshots"][1],
             basis="market_value",
         )
+        position_rows = [
+            row for row in comparison["rows"]
+            if row["contribution_source"] != "reconciliation"
+        ]
         self.assertEqual(
-            [row["symbol"] for row in comparison["rows"]],
+            [row["symbol"] for row in position_rows],
             [symbol for symbol, _delta in expected],
         )
         self.assertAlmostEqual(
@@ -138,6 +142,8 @@ class TimeSeriesStoreTest(unittest.TestCase):
             comparison["position_delta_sum"],
             sum(delta for _symbol, delta in expected),
         )
+        displayed_sum = sum(row["delta_value"] for row in comparison["rows"])
+        self.assertAlmostEqual(displayed_sum, comparison["net_liquidation_delta"])
 
     def test_symbol_comparison_adjusts_for_added_stock_flow(self):
         first = {
@@ -194,6 +200,12 @@ class TimeSeriesStoreTest(unittest.TestCase):
         self.assertAlmostEqual(row["flow_adjustment"], 15.0 * 1141.6)
         self.assertAlmostEqual(row["delta_value"], expected_contribution)
         self.assertEqual(row["contribution_source"], "flow_adjusted")
+        reconciliation = comparison["rows"][-1]
+        self.assertEqual(reconciliation["contribution_source"], "reconciliation")
+        self.assertAlmostEqual(
+            row["delta_value"] + reconciliation["delta_value"],
+            comparison["net_liquidation_delta"],
+        )
 
     def test_contract_level_comparison_uses_contract_marks(self):
         first = {

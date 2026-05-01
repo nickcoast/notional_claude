@@ -71,9 +71,12 @@ History comparisons estimate each position's contribution to the selected NLV
 move. When quantity changes and a cost basis is available, the comparison
 subtracts estimated trade flow from raw market-value change so adding or
 reducing shares does not dominate the list purely because capital moved into or
-out of the position. Contract-level portfolio marks are also stored so later
-views can drill into individual stock or option contracts. Daily high/low Net
-Liquidation values are rolled up as snapshots arrive.
+out of the position. A reconciliation row accounts for cash movement, fees,
+omitted rows, timing differences, and other non-position deltas so displayed
+contributions add back to the selected NLV change. Contract-level portfolio
+marks are also stored so later views can drill into individual stock or option
+contracts. Daily high/low Net Liquidation values are rolled up as snapshots
+arrive.
 
 ## Future work
 

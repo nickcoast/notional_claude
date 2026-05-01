@@ -581,11 +581,38 @@ class TimeSeriesStore:
                 }
             )
 
-        rows.sort(key=lambda item: item["abs_delta_value"], reverse=True)
-        position_delta_sum = sum(row["delta_value"] for row in rows)
-        rows = rows[:limit]
         start_nlv = _float_or_none(start["net_liquidation"]) or 0.0
         end_nlv = _float_or_none(end["net_liquidation"]) or 0.0
+        net_liquidation_delta = end_nlv - start_nlv
+        rows.sort(key=lambda item: item["abs_delta_value"], reverse=True)
+        position_delta_sum = sum(row["delta_value"] for row in rows)
+        omitted_position_count = max(len(rows) - limit, 0)
+        rows = rows[:limit]
+        displayed_position_delta_sum = sum(row["delta_value"] for row in rows)
+        reconciliation_delta = net_liquidation_delta - displayed_position_delta_sum
+        if abs(reconciliation_delta) >= 0.005:
+            label = "Cash / fees / unexplained"
+            if omitted_position_count:
+                label = "Cash / omitted / unexplained"
+            rows.append({
+                "position_key": "ACCOUNT:RECONCILIATION",
+                "symbol": "ACCOUNT",
+                "label": label,
+                "security_type": "ACCOUNT",
+                "start_value": None,
+                "end_value": None,
+                "delta_value": reconciliation_delta,
+                "abs_delta_value": abs(reconciliation_delta),
+                "raw_value_delta": reconciliation_delta,
+                "flow_adjustment": 0.0,
+                "contribution_source": "reconciliation",
+                "start_quantity": None,
+                "end_quantity": None,
+                "quantity_delta": None,
+                "start_price": None,
+                "end_price": None,
+                "price_delta": None,
+            })
 
         return {
             "account_filter": account_filter,
@@ -593,8 +620,11 @@ class TimeSeriesStore:
             "basis": basis,
             "start": dict(start),
             "end": dict(end),
-            "net_liquidation_delta": end_nlv - start_nlv,
+            "net_liquidation_delta": net_liquidation_delta,
             "position_delta_sum": position_delta_sum,
+            "displayed_position_delta_sum": displayed_position_delta_sum,
+            "reconciliation_delta": reconciliation_delta,
+            "omitted_position_count": omitted_position_count,
             "rows": rows,
         }
 

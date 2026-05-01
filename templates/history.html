@@ -432,7 +432,8 @@
             const label = timeLabel(start.as_of) + ' to ' + timeLabel(end.as_of);
             summaryEl.textContent = label + ' | NLV ' + money(start.net_liquidation)
                 + ' -> ' + money(end.net_liquidation)
-                + ' (' + money(data.net_liquidation_delta) + ')';
+                + ' (' + money(data.net_liquidation_delta) + ')'
+                + ' | Reconcile ' + money(data.reconciliation_delta);
 
             const rows = data.rows || [];
             if (!rows.length) {
@@ -443,8 +444,9 @@
             bodyEl.innerHTML = rows.map(function (row) {
                 const delta = Number(row.delta_value);
                 const deltaClass = delta < 0 ? 'text-red-400' : delta > 0 ? 'text-emerald-400' : 'text-gray-300';
+                const isReconciliation = row.contribution_source === 'reconciliation';
                 return '<tr class="border-b border-gray-800/60 hover:bg-gray-800/30">'
-                    + '<td class="py-1.5 pr-4 font-bold text-white">' + esc(row.label || row.symbol) + '</td>'
+                    + '<td class="py-1.5 pr-4 font-bold ' + (isReconciliation ? 'text-gray-400' : 'text-white') + '">' + esc(row.label || row.symbol) + '</td>'
                     + '<td class="py-1.5 px-2 text-gray-500">' + esc(row.security_type || '-') + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.start_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.end_value) + '</td>'
