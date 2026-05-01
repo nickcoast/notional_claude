@@ -102,6 +102,18 @@ also rolled up as snapshots arrive.
 | `price_cache.json` | Last-known underlying prices (reduces cost-basis fallback) |
 | `history.sqlite3` | Account, symbol, contract, and daily high/low history |
 
+## Testing
+
+Run the standard-library test suite with:
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+The time-series tests include a small anonymized fixture exported from a live
+`history.sqlite3` database. Account IDs, symbols, raw JSON payloads, and full
+database contents are not committed.
+
 ## Environment variables
 
 | Variable | Default | Description |

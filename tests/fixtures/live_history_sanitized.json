@@ -1,0 +1,324 @@
+{
+  "account_filter": "TEST_ACCOUNT",
+  "description": "Small anonymized fixture exported from a live history.sqlite3 database.",
+  "snapshots": [
+    {
+      "as_of": 1700000000.0,
+      "fixture_id": "snap_1",
+      "metrics": {
+        "buying_power": 2177.9365,
+        "gross_notional_leverage_ratio": 2.24,
+        "gross_position_value": 1889.2553,
+        "net_liquidation": 1054.7176,
+        "ngav": 2072.8583,
+        "ngav_gross": 2364.8442,
+        "notional_leverage_ratio": 1.97,
+        "portfolio_theta": -5.0192,
+        "sma": 94.4941,
+        "standard_leverage_ratio": 1.79
+      },
+      "positions": [
+        {
+          "npv": 193.5036,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 46.0,
+          "stock_value": 193.5036,
+          "symbol": "SYM001",
+          "underlying_market_price": 4.2066,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 369.5194,
+          "option_actual_value": 1.15,
+          "option_notional_shares": 13.4789,
+          "option_notional_value": 48.1328,
+          "stock_count": 90.0,
+          "stock_value": 321.3866,
+          "symbol": "SYM002",
+          "underlying_market_price": 3.571,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 205.5874,
+          "option_actual_value": 2.13,
+          "option_notional_shares": 3.5586,
+          "option_notional_value": 21.801,
+          "stock_count": 30.0,
+          "stock_value": 183.7864,
+          "symbol": "SYM003",
+          "underlying_market_price": 6.1262,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 22.325,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 50.0,
+          "stock_value": 22.325,
+          "symbol": "SYM004",
+          "underlying_market_price": 0.4465,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 55.5811,
+          "option_actual_value": 0.72,
+          "option_notional_shares": 50.8935,
+          "option_notional_value": 7.7735,
+          "stock_count": 313.0,
+          "stock_value": 47.8076,
+          "symbol": "SYM005",
+          "underlying_market_price": 0.1527,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 54.9655,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 5.0,
+          "stock_value": 54.9655,
+          "symbol": "SYM006",
+          "underlying_market_price": 10.9931,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": -19.7635,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": -5.0,
+          "stock_value": -19.7635,
+          "symbol": "SYM007",
+          "underlying_market_price": 3.9527,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 28.406,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 20.0,
+          "stock_value": 28.406,
+          "symbol": "SYM008",
+          "underlying_market_price": 1.4203,
+          "underlying_price_source": "snapshot"
+        }
+      ]
+    },
+    {
+      "as_of": 1700000020.548455,
+      "fixture_id": "snap_2",
+      "metrics": {
+        "buying_power": 2175.7857,
+        "gross_notional_leverage_ratio": 2.24,
+        "gross_position_value": 1891.9207,
+        "net_liquidation": 1057.366,
+        "ngav": 2072.4465,
+        "ngav_gross": 2364.3287,
+        "notional_leverage_ratio": 1.96,
+        "portfolio_theta": -4.9978,
+        "sma": 95.5501,
+        "standard_leverage_ratio": 1.79
+      },
+      "positions": [
+        {
+          "npv": 193.4898,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 46.0,
+          "stock_value": 193.4898,
+          "symbol": "SYM001",
+          "underlying_market_price": 4.2063,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 368.9205,
+          "option_actual_value": 1.17,
+          "option_notional_shares": 13.3112,
+          "option_notional_value": 47.5338,
+          "stock_count": 90.0,
+          "stock_value": 321.3866,
+          "symbol": "SYM002",
+          "underlying_market_price": 3.571,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 205.6236,
+          "option_actual_value": 0.49,
+          "option_notional_shares": 3.5646,
+          "option_notional_value": 21.8372,
+          "stock_count": 30.0,
+          "stock_value": 183.7864,
+          "symbol": "SYM003",
+          "underlying_market_price": 6.1262,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 22.335,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 50.0,
+          "stock_value": 22.335,
+          "symbol": "SYM004",
+          "underlying_market_price": 0.4467,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 55.6757,
+          "option_actual_value": 0.72,
+          "option_notional_shares": 50.8935,
+          "option_notional_value": 7.7867,
+          "stock_count": 313.0,
+          "stock_value": 47.889,
+          "symbol": "SYM005",
+          "underlying_market_price": 0.153,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 54.988,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 5.0,
+          "stock_value": 54.988,
+          "symbol": "SYM006",
+          "underlying_market_price": 10.9976,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": -19.7715,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": -5.0,
+          "stock_value": -19.7715,
+          "symbol": "SYM007",
+          "underlying_market_price": 3.9543,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 28.456,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 20.0,
+          "stock_value": 28.456,
+          "symbol": "SYM008",
+          "underlying_market_price": 1.4228,
+          "underlying_price_source": "snapshot"
+        }
+      ]
+    },
+    {
+      "as_of": 1700000041.087925,
+      "fixture_id": "snap_3",
+      "metrics": {
+        "buying_power": 2175.7857,
+        "gross_notional_leverage_ratio": 2.24,
+        "gross_position_value": 1891.9207,
+        "net_liquidation": 1057.366,
+        "ngav": 2075.6463,
+        "ngav_gross": 2367.1557,
+        "notional_leverage_ratio": 1.96,
+        "portfolio_theta": -4.9161,
+        "sma": 95.5501,
+        "standard_leverage_ratio": 1.79
+      },
+      "positions": [
+        {
+          "npv": 193.4898,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 46.0,
+          "stock_value": 193.4898,
+          "symbol": "SYM001",
+          "underlying_market_price": 4.2063,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 368.2811,
+          "option_actual_value": 1.11,
+          "option_notional_shares": 13.1495,
+          "option_notional_value": 46.9486,
+          "stock_count": 90.0,
+          "stock_value": 321.3325,
+          "symbol": "SYM002",
+          "underlying_market_price": 3.5704,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 207.7081,
+          "option_actual_value": 0.49,
+          "option_notional_shares": 3.9048,
+          "option_notional_value": 23.9217,
+          "stock_count": 30.0,
+          "stock_value": 183.7864,
+          "symbol": "SYM003",
+          "underlying_market_price": 6.1262,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 22.29,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 50.0,
+          "stock_value": 22.29,
+          "symbol": "SYM004",
+          "underlying_market_price": 0.4458,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 55.7121,
+          "option_actual_value": 0.72,
+          "option_notional_shares": 51.1316,
+          "option_notional_value": 7.8231,
+          "stock_count": 313.0,
+          "stock_value": 47.889,
+          "symbol": "SYM005",
+          "underlying_market_price": 0.153,
+          "underlying_price_source": "option_greeks"
+        },
+        {
+          "npv": 55.0605,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 5.0,
+          "stock_value": 55.0605,
+          "symbol": "SYM006",
+          "underlying_market_price": 11.0121,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": -19.7765,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": -5.0,
+          "stock_value": -19.7765,
+          "symbol": "SYM007",
+          "underlying_market_price": 3.9553,
+          "underlying_price_source": "snapshot"
+        },
+        {
+          "npv": 28.444,
+          "option_actual_value": 0.0,
+          "option_notional_shares": 0.0,
+          "option_notional_value": 0.0,
+          "stock_count": 20.0,
+          "stock_value": 28.444,
+          "symbol": "SYM008",
+          "underlying_market_price": 1.4222,
+          "underlying_price_source": "snapshot"
+        }
+      ]
+    }
+  ]
+}
