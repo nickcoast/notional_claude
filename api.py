@@ -6,6 +6,7 @@ Run with:
 
 Configuration via environment variables:
     IB_POLL_INTERVAL   Seconds between portfolio fetches (default 15, min 10)
+    IB_HISTORY_DB      SQLite path for stored history (default history.sqlite3)
 """
 
 import asyncio
@@ -14,8 +15,9 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
@@ -106,6 +108,11 @@ async def index(request: Request):
 @app.get("/orders")
 async def orders_page(request: Request):
     return templates.TemplateResponse("orders.html", {"request": request})
+
+
+@app.get("/history")
+async def history_page(request: Request):
+    return templates.TemplateResponse("history.html", {"request": request})
 
 
 @app.get("/debug/positions", response_class=HTMLResponse)
@@ -298,6 +305,49 @@ async def orders_json():
             {"error": "Initial fetch in progress — try again in a few seconds"},
             status_code=503,
         )
+    return data
+
+
+@app.get("/history.json")
+async def history_json(
+    account: Optional[str] = None,
+    limit: int = Query(1000, ge=1, le=10000),
+    start_as_of: Optional[float] = None,
+    end_as_of: Optional[float] = None,
+):
+    """Net Liquidation history points for charting."""
+    return service.get_history(
+        account_filter=account,
+        limit=limit,
+        start_as_of=start_as_of,
+        end_as_of=end_as_of,
+    )
+
+
+@app.get("/history/compare")
+async def history_compare(
+    start_id: int = Query(..., ge=1),
+    end_id: int = Query(..., ge=1),
+    account: Optional[str] = None,
+    basis: str = Query("market_value"),
+    level: str = Query("symbol"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Compare position-value changes between two stored snapshots."""
+    try:
+        data = service.compare_history_positions(
+            start_id=start_id,
+            end_id=end_id,
+            account_filter=account,
+            basis=basis,
+            level=level,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    if data is None:
+        return JSONResponse({"error": "Snapshot not found"}, status_code=404)
     return data
 
 

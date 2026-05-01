@@ -1,9 +1,13 @@
 .env
 options_cache.db
 options_cache.db-journal
+history.sqlite3
+history.sqlite3-*
 delta_cache.json
 price_cache.json
 config.json
+*.swp
+.*.swp
 
 
 __pycache__/

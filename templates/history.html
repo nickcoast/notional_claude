@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IB History</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace; }
+        canvas { display: block; width: 100%; height: 320px; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+    <div class="px-4 py-4 max-w-screen-2xl mx-auto">
+
+        <div class="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
+            <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
+                IB History
+            </h1>
+            <nav class="flex items-center gap-1 text-xs">
+                <a href="/"
+                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
+                <a href="/orders"
+                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Orders</a>
+                <a href="/history"
+                   class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">History</a>
+            </nav>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-5 gap-3 mb-4">
+            <label class="text-xs text-gray-500">
+                Window
+                <select id="history-limit"
+                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
+                    <option value="250">250 polls</option>
+                    <option value="1000" selected>1000 polls</option>
+                    <option value="5000">5000 polls</option>
+                    <option value="10000">10000 polls</option>
+                </select>
+            </label>
+            <label class="text-xs text-gray-500">
+                Start point
+                <select id="start-point"
+                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200"></select>
+            </label>
+            <label class="text-xs text-gray-500">
+                End point
+                <select id="end-point"
+                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200"></select>
+            </label>
+            <label class="text-xs text-gray-500">
+                Level
+                <select id="compare-level"
+                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
+                    <option value="symbol" selected>Symbol</option>
+                    <option value="contract">Contract</option>
+                </select>
+            </label>
+            <label class="text-xs text-gray-500">
+                Basis
+                <select id="compare-basis"
+                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
+                    <option value="market_value" selected>Market value</option>
+                    <option value="npv">NPV</option>
+                    <option value="stock_value">Stock value</option>
+                    <option value="option_actual_value">Option actual</option>
+                    <option value="option_notional_value">Option notional</option>
+                </select>
+            </label>
+        </div>
+
+        <div class="mb-4 border border-gray-800 rounded bg-gray-950">
+            <div class="flex items-center justify-between px-3 py-2 border-b border-gray-800 text-xs">
+                <div>
+                    <span class="text-gray-500">Account</span>
+                    <span id="history-account" class="text-gray-200 ml-2">-</span>
+                </div>
+                <div id="daily-extremes" class="text-gray-500"></div>
+            </div>
+            <canvas id="nlv-chart" aria-label="Net Liquidation chart"></canvas>
+        </div>
+
+        <div class="flex items-center justify-between mb-2">
+            <div id="range-summary" class="text-xs text-gray-500"></div>
+            <button id="compare-button"
+                    class="text-xs bg-gray-800 border border-gray-700 rounded px-3 py-1 text-gray-200 hover:bg-gray-700">
+                Compare
+            </button>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="w-full text-xs border-collapse">
+                <thead>
+                    <tr class="text-gray-500 border-b border-gray-700">
+                        <th class="text-left py-2 pr-4 font-medium">Position</th>
+                        <th class="text-left py-2 px-2 font-medium">Type</th>
+                        <th class="text-right py-2 px-2 font-medium">Start</th>
+                        <th class="text-right py-2 px-2 font-medium">End</th>
+                        <th class="text-right py-2 px-2 font-medium">Change</th>
+                        <th class="text-right py-2 px-2 font-medium">Qty Change</th>
+                        <th class="text-right py-2 pl-2 font-medium">Price Change</th>
+                    </tr>
+                </thead>
+                <tbody id="compare-body">
+                    <tr>
+                        <td colspan="7" class="py-8 text-center text-gray-600">
+                            Waiting for stored history.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        const state = {
+            points: [],
+            account: null,
+            selectedStartId: null,
+            selectedEndId: null,
+        };
+
+        const canvas = document.getElementById('nlv-chart');
+        const ctx = canvas.getContext('2d');
+        const limitEl = document.getElementById('history-limit');
+        const startEl = document.getElementById('start-point');
+        const endEl = document.getElementById('end-point');
+        const levelEl = document.getElementById('compare-level');
+        const basisEl = document.getElementById('compare-basis');
+        const accountEl = document.getElementById('history-account');
+        const extremesEl = document.getElementById('daily-extremes');
+        const summaryEl = document.getElementById('range-summary');
+        const bodyEl = document.getElementById('compare-body');
+        const compareButton = document.getElementById('compare-button');
+
+        function money(value) {
+            const number = Number(value);
+            if (!Number.isFinite(number)) return '-';
+            return new Intl.NumberFormat(undefined, {
+                style: 'currency',
+                currency: 'USD',
+                maximumFractionDigits: 0,
+            }).format(number);
+        }
+
+        function number(value, decimals) {
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed)) return '-';
+            return parsed.toLocaleString(undefined, {
+                minimumFractionDigits: decimals,
+                maximumFractionDigits: decimals,
+            });
+        }
+
+        function timeLabel(ts) {
+            const date = new Date(Number(ts) * 1000);
+            if (Number.isNaN(date.getTime())) return '-';
+            return date.toLocaleString(undefined, {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+            });
+        }
+
+        function esc(text) {
+            return String(text == null ? '' : text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function pointById(id) {
+            return state.points.find(function (point) {
+                return String(point.id) === String(id);
+            });
+        }
+
+        function renderSelectors() {
+            const startValue = state.selectedStartId;
+            const endValue = state.selectedEndId;
+
+            [startEl, endEl].forEach(function (select) {
+                select.innerHTML = '';
+                const blank = document.createElement('option');
+                blank.value = '';
+                blank.textContent = '-';
+                select.appendChild(blank);
+                state.points.forEach(function (point) {
+                    const option = document.createElement('option');
+                    option.value = point.id;
+                    option.textContent = timeLabel(point.as_of) + ' ' + money(point.net_liquidation);
+                    select.appendChild(option);
+                });
+                select.value = '';
+            });
+
+            if (startValue && pointById(startValue)) {
+                startEl.value = startValue;
+            }
+            if (endValue && pointById(endValue)) {
+                endEl.value = endValue;
+            }
+        }
+
+        function syncSelectedFromControls() {
+            state.selectedStartId = startEl.value || null;
+            state.selectedEndId = endEl.value || null;
+        }
+
+        function syncBasisControl() {
+            const contractLevel = levelEl.value === 'contract';
+            basisEl.disabled = contractLevel;
+            basisEl.classList.toggle('opacity-50', contractLevel);
+            if (contractLevel) {
+                basisEl.value = 'market_value';
+            }
+        }
+
+        function setDefaultSelection() {
+            const points = state.points;
+            if (points.length >= 2) {
+                if (!state.selectedStartId || !pointById(state.selectedStartId)) {
+                    state.selectedStartId = points[points.length - 2].id;
+                }
+                if (!state.selectedEndId || !pointById(state.selectedEndId)) {
+                    state.selectedEndId = points[points.length - 1].id;
+                }
+            } else if (points.length === 1) {
+                state.selectedStartId = points[0].id;
+                state.selectedEndId = points[0].id;
+            } else {
+                state.selectedStartId = null;
+                state.selectedEndId = null;
+            }
+        }
+
+        function chartGeometry(width, height, points) {
+            const pad = { left: 68, right: 16, top: 18, bottom: 34 };
+            const values = points
+                .map(function (point) { return Number(point.net_liquidation); })
+                .filter(Number.isFinite);
+            const times = points
+                .map(function (point) { return Number(point.as_of); })
+                .filter(Number.isFinite);
+            let minValue = Math.min.apply(null, values);
+            let maxValue = Math.max.apply(null, values);
+            const minTime = Math.min.apply(null, times);
+            const maxTime = Math.max.apply(null, times);
+            if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+                minValue = 0;
+                maxValue = 1;
+            }
+            if (minValue === maxValue) {
+                minValue -= 1;
+                maxValue += 1;
+            }
+            const valuePad = (maxValue - minValue) * 0.08;
+            minValue -= valuePad;
+            maxValue += valuePad;
+
+            function xFor(point) {
+                const span = maxTime - minTime;
+                if (!Number.isFinite(span) || span <= 0) return pad.left;
+                return pad.left + ((Number(point.as_of) - minTime) / span) * (width - pad.left - pad.right);
+            }
+
+            function yFor(point) {
+                const value = Number(point.net_liquidation);
+                return pad.top + (1 - ((value - minValue) / (maxValue - minValue))) * (height - pad.top - pad.bottom);
+            }
+
+            return { pad, minValue, maxValue, xFor, yFor };
+        }
+
+        function drawChart() {
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(rect.width, 320);
+            const height = 320;
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, width, height);
+
+            ctx.fillStyle = '#030712';
+            ctx.fillRect(0, 0, width, height);
+
+            const points = state.points.filter(function (point) {
+                return Number.isFinite(Number(point.net_liquidation));
+            });
+            if (!points.length) {
+                ctx.fillStyle = '#4b5563';
+                ctx.font = '12px ui-monospace, monospace';
+                ctx.fillText('No stored NLV history yet.', 18, 32);
+                return;
+            }
+
+            const geo = chartGeometry(width, height, points);
+
+            ctx.strokeStyle = '#1f2937';
+            ctx.lineWidth = 1;
+            ctx.fillStyle = '#6b7280';
+            ctx.font = '11px ui-monospace, monospace';
+            for (let i = 0; i <= 4; i += 1) {
+                const y = geo.pad.top + i * ((height - geo.pad.top - geo.pad.bottom) / 4);
+                const value = geo.maxValue - i * ((geo.maxValue - geo.minValue) / 4);
+                ctx.beginPath();
+                ctx.moveTo(geo.pad.left, y);
+                ctx.lineTo(width - geo.pad.right, y);
+                ctx.stroke();
+                ctx.fillText(money(value), 8, y + 4);
+            }
+
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            points.forEach(function (point, index) {
+                const x = geo.xFor(point);
+                const y = geo.yFor(point);
+                if (index === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            });
+            ctx.stroke();
+
+            drawSelection(geo, points, state.selectedStartId, '#f59e0b', width, height);
+            drawSelection(geo, points, state.selectedEndId, '#22c55e', width, height);
+
+            ctx.fillStyle = '#6b7280';
+            ctx.fillText(timeLabel(points[0].as_of), geo.pad.left, height - 10);
+            ctx.textAlign = 'right';
+            ctx.fillText(timeLabel(points[points.length - 1].as_of), width - geo.pad.right, height - 10);
+            ctx.textAlign = 'left';
+        }
+
+        function drawSelection(geo, points, id, color, width, height) {
+            const point = pointById(id);
+            if (!point) return;
+            const x = geo.xFor(point);
+            const y = geo.yFor(point);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x, geo.pad.top);
+            ctx.lineTo(x, height - geo.pad.bottom);
+            ctx.stroke();
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        function nearestPoint(clientX) {
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(rect.width, 320);
+            const points = state.points.filter(function (point) {
+                return Number.isFinite(Number(point.net_liquidation));
+            });
+            if (!points.length) return null;
+            const geo = chartGeometry(width, 320, points);
+            const x = clientX - rect.left;
+            let best = null;
+            let bestDistance = Infinity;
+            points.forEach(function (point) {
+                const distance = Math.abs(geo.xFor(point) - x);
+                if (distance < bestDistance) {
+                    best = point;
+                    bestDistance = distance;
+                }
+            });
+            return best;
+        }
+
+        async function loadHistory() {
+            const response = await fetch('/history.json?limit=' + encodeURIComponent(limitEl.value));
+            if (!response.ok) throw new Error('history fetch failed');
+            const data = await response.json();
+            state.points = data.points || [];
+            state.account = data.account || '-';
+            accountEl.textContent = state.account;
+
+            const latest = (data.daily_extremes || [])[data.daily_extremes.length - 1];
+            extremesEl.textContent = latest
+                ? 'Daily H ' + money(latest.high_net_liquidation) + ' / L ' + money(latest.low_net_liquidation)
+                : '';
+
+            setDefaultSelection();
+            renderSelectors();
+            if (state.selectedStartId) startEl.value = state.selectedStartId;
+            if (state.selectedEndId) endEl.value = state.selectedEndId;
+            syncSelectedFromControls();
+            drawChart();
+            await compareSelected();
+        }
+
+        async function compareSelected() {
+            syncBasisControl();
+            syncSelectedFromControls();
+            drawChart();
+
+            if (!state.selectedStartId || !state.selectedEndId || state.selectedStartId === state.selectedEndId) {
+                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">Select two different points.</td></tr>';
+                summaryEl.textContent = '';
+                return;
+            }
+
+            const params = new URLSearchParams({
+                start_id: state.selectedStartId,
+                end_id: state.selectedEndId,
+                level: levelEl.value,
+                basis: basisEl.value,
+                limit: '100',
+            });
+            const response = await fetch('/history/compare?' + params.toString());
+            if (!response.ok) {
+                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">Comparison is not available for those points.</td></tr>';
+                summaryEl.textContent = '';
+                return;
+            }
+            const data = await response.json();
+            renderComparison(data);
+        }
+
+        function renderComparison(data) {
+            const start = data.start || {};
+            const end = data.end || {};
+            const label = timeLabel(start.as_of) + ' to ' + timeLabel(end.as_of);
+            summaryEl.textContent = label + ' | NLV ' + money(start.net_liquidation)
+                + ' -> ' + money(end.net_liquidation)
+                + ' (' + money(data.net_liquidation_delta) + ')';
+
+            const rows = data.rows || [];
+            if (!rows.length) {
+                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">No position changes found.</td></tr>';
+                return;
+            }
+
+            bodyEl.innerHTML = rows.map(function (row) {
+                const delta = Number(row.delta_value);
+                const deltaClass = delta < 0 ? 'text-red-400' : delta > 0 ? 'text-emerald-400' : 'text-gray-300';
+                return '<tr class="border-b border-gray-800/60 hover:bg-gray-800/30">'
+                    + '<td class="py-1.5 pr-4 font-bold text-white">' + esc(row.label || row.symbol) + '</td>'
+                    + '<td class="py-1.5 px-2 text-gray-500">' + esc(row.security_type || '-') + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.start_value) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.end_value) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums font-semibold ' + deltaClass + '">' + money(row.delta_value) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + number(row.quantity_delta, 2) + '</td>'
+                    + '<td class="py-1.5 pl-2 text-right tabular-nums text-gray-300">' + money(row.price_delta) + '</td>'
+                    + '</tr>';
+            }).join('');
+        }
+
+        canvas.addEventListener('click', function (event) {
+            const point = nearestPoint(event.clientX);
+            if (!point) return;
+            if (!state.selectedStartId || (state.selectedStartId && state.selectedEndId)) {
+                state.selectedStartId = point.id;
+                state.selectedEndId = null;
+            } else {
+                state.selectedEndId = point.id;
+                const start = pointById(state.selectedStartId);
+                if (start && Number(start.as_of) > Number(point.as_of)) {
+                    state.selectedEndId = state.selectedStartId;
+                    state.selectedStartId = point.id;
+                }
+            }
+            renderSelectors();
+            if (state.selectedStartId) startEl.value = state.selectedStartId;
+            if (state.selectedEndId) endEl.value = state.selectedEndId;
+            compareSelected();
+        });
+
+        [startEl, endEl, levelEl, basisEl].forEach(function (el) {
+            el.addEventListener('change', compareSelected);
+        });
+        limitEl.addEventListener('change', loadHistory);
+        compareButton.addEventListener('click', compareSelected);
+        window.addEventListener('resize', drawChart);
+
+        loadHistory().catch(function () {
+            bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">History is not available yet.</td></tr>';
+        });
+        setInterval(function () {
+            loadHistory().catch(function () {});
+        }, 15000);
+    }());
+    </script>
+</body>
+</html>

@@ -36,8 +36,11 @@ The selection is saved back to `config.json` automatically.
 |---|---|
 | `GET /` | Dashboard UI |
 | `GET /orders` | Read-only open orders UI |
+| `GET /history` | Net Liquidation history and position-change UI |
 | `GET /snapshot` | Current portfolio snapshot (JSON) |
 | `GET /orders.json` | Current open orders snapshot (JSON) |
+| `GET /history.json` | Stored Net Liquidation history points (JSON) |
+| `GET /history/compare` | Position value changes between two stored snapshots |
 | `GET /health` | IB connection and quote-quality diagnostics |
 | `GET /accounts` | Managed accounts with display names |
 | `POST /account` | Set active account filter |
@@ -56,6 +59,14 @@ orders use last trade when available; option orders prefer the bid/ask midpoint.
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days.
 
+The history page persists one SQLite row per successful poll. Account snapshots
+store Net Liquidation and other account-level metrics for charting; symbol-level
+position snapshots store market value, stock value, option actual value, option
+notional value, and NPV for change attribution. Contract-level portfolio marks
+from IB are stored separately so a future detail view can explain moves by
+individual stock or option contract. Daily high/low Net Liquidation values are
+also rolled up as snapshots arrive.
+
 ## Future work
 
 - Flag open-order quantity exposure that exceeds the current position. For each
@@ -63,13 +74,9 @@ Portfolio and order symbols use the same earnings-date highlighting: red within
   position so the app can warn when pending close/reduction orders, including
   OCA groups, may add up to more than the position after partial exits or
   forgotten order adjustments.
-- Save time-series history for post-mortems on large account-value moves. A
-  first pass could persist daily high/low Net Liquidation values. A fuller
-  implementation should capture account-level values and per-position marks so
-  large NLV spikes and drops can be explained later by symbol and contract. For
-  pricing, use last trade for stocks and investigate whether IB's own option
-  valuation is closest to bid/ask midpoint, model price, or another mark before
-  choosing the stored option reference price.
+- Investigate whether IB's option portfolio marks are closest to bid/ask
+  midpoint, model price, or another mark before adding alternate option-price
+  bases to history comparisons.
 - Add configurable table columns. Portfolio and order tables should support
   drag-to-reorder columns plus a column-visibility menu, likely behind a gear
   icon with checkboxes. Hidden columns should still be fetched and kept current
@@ -93,9 +100,11 @@ Portfolio and order symbols use the same earnings-date highlighting: red within
 | `config.json` | Account nicknames, selected account |
 | `delta_cache.json` | Last-known option deltas (survives market close) |
 | `price_cache.json` | Last-known underlying prices (reduces cost-basis fallback) |
+| `history.sqlite3` | Account, symbol, contract, and daily high/low history |
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `IB_POLL_INTERVAL` | `15` | Seconds between portfolio fetches (minimum 10) |
+| `IB_HISTORY_DB` | `history.sqlite3` | SQLite path for stored time-series history |

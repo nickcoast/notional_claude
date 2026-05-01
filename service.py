@@ -6,6 +6,7 @@ all IB calls stay confined to the polling thread's event loop.
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -18,6 +19,7 @@ from ib_insync import IB
 import portfolio as portfolio_module
 from earnings import EarningsCache
 from market_data import pick_price_from_ticker
+from timeseries import DEFAULT_HISTORY_DB_FILE, TimeSeriesStore
 from utils import (
     configure_locale,
     get_account_value,
@@ -259,6 +261,8 @@ class IBPollingService:
 
     def __init__(self, poll_interval: int = DEFAULT_POLL_INTERVAL):
         self.poll_interval = max(int(poll_interval), MIN_POLL_INTERVAL)
+        history_db_path = os.getenv("IB_HISTORY_DB", str(DEFAULT_HISTORY_DB_FILE))
+        self._history_store = TimeSeriesStore(history_db_path)
 
         self.ib = IB()
         self.ib.RequestTimeout = 20
@@ -329,6 +333,44 @@ class IBPollingService:
                 "orders": list(self._snapshot.get("orders", [])),
                 "health": dict(self._snapshot.get("health", {})),
             }
+
+    def get_history(
+        self,
+        account_filter: Optional[str] = None,
+        limit: int = 1000,
+        start_as_of: Optional[float] = None,
+        end_as_of: Optional[float] = None,
+    ) -> dict:
+        account_filter = account_filter or self._selected_account
+        return {
+            "account": account_filter,
+            "points": self._history_store.get_net_liquidation_history(
+                account_filter=account_filter,
+                limit=limit,
+                start_as_of=start_as_of,
+                end_as_of=end_as_of,
+            ),
+            "daily_extremes": self._history_store.get_daily_extremes(account_filter),
+            "poll_interval": self.poll_interval,
+        }
+
+    def compare_history_positions(
+        self,
+        start_id: int,
+        end_id: int,
+        account_filter: Optional[str] = None,
+        basis: str = "market_value",
+        level: str = "symbol",
+        limit: int = 100,
+    ) -> Optional[dict]:
+        return self._history_store.compare_positions(
+            account_filter=account_filter or self._selected_account,
+            start_id=start_id,
+            end_id=end_id,
+            basis=basis,
+            level=level,
+            limit=limit,
+        )
 
     def get_accounts(self) -> dict:
         """Return account list and current selection (safe to call from any thread)."""
@@ -413,6 +455,7 @@ class IBPollingService:
             account_filter=self._selected_account,
         )
         open_orders = self._fetch_open_orders()
+        contract_positions = self._fetch_position_components()
         as_of = time.time()
 
         # Persist caches so last-known values survive a restart.
@@ -435,6 +478,7 @@ class IBPollingService:
             earnings=self._earnings_cache.snapshot(),
             open_orders=open_orders,
         )
+        snapshot["account"] = self._selected_account
 
         debug = None
         if positions_by_underlying:
@@ -464,14 +508,58 @@ class IBPollingService:
             self._snapshot = snapshot
             self._debug = debug
 
-        # ── Time-series hook ──────────────────────────────────────────────────
-        # When you're ready to persist snapshots, add a call here.
-        # The snapshot dict is the natural unit of storage: one timestamped
-        # record per successful fetch.  Example:
-        #
-        #     db.insert_snapshot(snapshot)
-        #
+        try:
+            self._history_store.insert_snapshot(
+                snapshot,
+                account_filter=self._selected_account,
+                contract_positions=contract_positions,
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist time-series snapshot: %s", exc, exc_info=True)
+
         logger.debug("Snapshot stored (as_of=%.1f, positions=%d)", as_of, len(snapshot["positions"]))
+
+    def _fetch_position_components(self) -> list[dict]:
+        """Fetch contract-level portfolio marks for time-series post-mortems."""
+        if not self.ib.isConnected():
+            return []
+
+        try:
+            portfolio_items = self.ib.portfolio() or []
+        except Exception as exc:
+            logger.warning("Failed to fetch portfolio items for history: %s", exc)
+            return []
+
+        positions = []
+        for item in portfolio_items:
+            contract = getattr(item, "contract", None)
+            account = getattr(item, "account", "")
+            if self._selected_account != "ALL" and account != self._selected_account:
+                continue
+            if contract is None:
+                continue
+
+            positions.append({
+                "account": account,
+                "symbol": getattr(contract, "symbol", ""),
+                "local_symbol": getattr(contract, "localSymbol", ""),
+                "security_type": getattr(contract, "secType", ""),
+                "con_id": int(safe_float_conversion(getattr(contract, "conId", 0))),
+                "expiry": getattr(contract, "lastTradeDateOrContractMonth", ""),
+                "strike": safe_float_conversion(getattr(contract, "strike", None)),
+                "right": getattr(contract, "right", ""),
+                "multiplier": safe_float_conversion(getattr(contract, "multiplier", None)),
+                "quantity": safe_float_conversion(getattr(item, "position", None)),
+                "market_price": safe_float_conversion(getattr(item, "marketPrice", None)),
+                "market_value": safe_float_conversion(getattr(item, "marketValue", None)),
+                "average_cost": safe_float_conversion(getattr(item, "averageCost", None)),
+                "unrealized_pnl": safe_float_conversion(getattr(item, "unrealizedPNL", None)),
+                "realized_pnl": safe_float_conversion(getattr(item, "realizedPNL", None)),
+                "currency": getattr(contract, "currency", ""),
+                "price_source": "ib_portfolio",
+            })
+
+        return positions
 
     def _fetch_open_orders(self) -> list[dict]:
         """Fetch and normalize open IB orders without trading side effects."""
