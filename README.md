@@ -56,6 +56,26 @@ orders use last trade when available; option orders prefer the bid/ask midpoint.
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days.
 
+## Future work
+
+- Flag open-order quantity exposure that exceeds the current position. For each
+  symbol, compare open orders on either side of the market against the held
+  position so the app can warn when pending close/reduction orders, including
+  OCA groups, may add up to more than the position after partial exits or
+  forgotten order adjustments.
+- Save time-series history for post-mortems on large account-value moves. A
+  first pass could persist daily high/low Net Liquidation values. A fuller
+  implementation should capture account-level values and per-position marks so
+  large NLV spikes and drops can be explained later by symbol and contract. For
+  pricing, use last trade for stocks and investigate whether IB's own option
+  valuation is closest to bid/ask midpoint, model price, or another mark before
+  choosing the stored option reference price.
+- Add configurable table columns. Portfolio and order tables should support
+  drag-to-reorder columns plus a column-visibility menu, likely behind a gear
+  icon with checkboxes. Hidden columns should still be fetched and kept current
+  so they reappear immediately and remain available for analytics such as
+  time-series storage.
+
 ## What is calculated vs. from IB
 
 **From IB directly** (`accountSummary`):
