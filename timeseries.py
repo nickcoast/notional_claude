@@ -65,6 +65,16 @@ def _json_dumps(data) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _json_loads_dict(data: Optional[str]) -> dict:
+    if not data:
+        return {}
+    try:
+        loaded = json.loads(data)
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 class TimeSeriesStore:
     """Persist and query portfolio history in a local SQLite database."""
 
@@ -530,10 +540,17 @@ class TimeSeriesStore:
             after = end_positions.get(key, {})
             start_value = _float_or_none(before.get("value")) or 0.0
             end_value = _float_or_none(after.get("value")) or 0.0
+            raw_value_delta = end_value - start_value
             start_quantity = _float_or_none(before.get("quantity"))
             end_quantity = _float_or_none(after.get("quantity"))
             start_price = _float_or_none(before.get("market_price"))
             end_price = _float_or_none(after.get("market_price"))
+            contribution, flow_adjustment, contribution_source = self._value_contribution(
+                before=before,
+                after=after,
+                raw_value_delta=raw_value_delta,
+                basis=basis,
+            )
             rows.append(
                 {
                     "position_key": key,
@@ -542,8 +559,11 @@ class TimeSeriesStore:
                     "security_type": after.get("security_type") or before.get("security_type"),
                     "start_value": start_value,
                     "end_value": end_value,
-                    "delta_value": end_value - start_value,
-                    "abs_delta_value": abs(end_value - start_value),
+                    "delta_value": contribution,
+                    "abs_delta_value": abs(contribution),
+                    "raw_value_delta": raw_value_delta,
+                    "flow_adjustment": flow_adjustment,
+                    "contribution_source": contribution_source,
                     "start_quantity": start_quantity,
                     "end_quantity": end_quantity,
                     "quantity_delta": (
@@ -578,6 +598,44 @@ class TimeSeriesStore:
             "rows": rows,
         }
 
+    @staticmethod
+    def _value_contribution(
+        before: dict,
+        after: dict,
+        raw_value_delta: float,
+        basis: str,
+    ) -> tuple[float, float, str]:
+        """
+        Estimate how much a position contributed to NLV movement.
+
+        Raw market-value delta is noisy when quantity changes because new cash
+        deployed into a position shows up as "position value change."  For the
+        actual-value basis, subtract the estimated trade flow from the raw delta
+        when a cost basis is available:
+
+            contribution ~= value_delta - quantity_delta * cost_basis
+
+        This keeps additions/reductions from dwarfing the actual mark-to-market
+        movement.  If no cost basis is available, fall back to raw delta.
+        """
+        if basis != "market_value":
+            return raw_value_delta, 0.0, "raw_value_delta"
+
+        start_quantity = _float_or_none(before.get("quantity")) or 0.0
+        end_quantity = _float_or_none(after.get("quantity")) or 0.0
+        quantity_delta = end_quantity - start_quantity
+        if abs(quantity_delta) < 1e-9:
+            return raw_value_delta, 0.0, "mark_to_market"
+
+        cost_basis = _float_or_none(after.get("cost_basis"))
+        if cost_basis is None:
+            cost_basis = _float_or_none(before.get("cost_basis"))
+        if cost_basis is None:
+            return raw_value_delta, 0.0, "raw_value_delta"
+
+        flow_adjustment = quantity_delta * cost_basis
+        return raw_value_delta - flow_adjustment, flow_adjustment, "flow_adjusted"
+
     def _account_snapshot(self, conn, account_filter: str, snapshot_id: int):
         return conn.execute(
             """
@@ -592,29 +650,36 @@ class TimeSeriesStore:
         rows = conn.execute(
             f"""
             SELECT position_key, symbol, security_type, quantity, market_price,
-                   {value_column} AS value
+                   stock_value, option_actual_value, option_notional_value, npv,
+                   raw_json, {value_column} AS value
             FROM position_snapshots
             WHERE account_snapshot_id = ?
             """,
             (snapshot_id,),
         ).fetchall()
-        return {
-            row["position_key"]: {
+        result = {}
+        for row in rows:
+            raw = _json_loads_dict(row["raw_json"])
+            result[row["position_key"]] = {
                 "symbol": row["symbol"],
                 "label": row["symbol"],
                 "security_type": row["security_type"],
                 "quantity": row["quantity"],
                 "market_price": row["market_price"],
                 "value": row["value"],
+                "cost_basis": _float_or_none(raw.get("underlying_cost_basis")),
+                "stock_value": row["stock_value"],
+                "option_actual_value": row["option_actual_value"],
+                "option_notional_value": row["option_notional_value"],
+                "npv": row["npv"],
             }
-            for row in rows
-        }
+        return result
 
     def _contract_positions(self, conn, snapshot_id: int) -> dict:
         rows = conn.execute(
             """
             SELECT position_key, symbol, local_symbol, security_type, quantity,
-                   market_price, market_value AS value
+                   market_price, average_cost, market_value AS value
             FROM contract_snapshots
             WHERE account_snapshot_id = ?
             """,
@@ -627,6 +692,7 @@ class TimeSeriesStore:
                 "security_type": row["security_type"],
                 "quantity": row["quantity"],
                 "market_price": row["market_price"],
+                "cost_basis": row["average_cost"],
                 "value": row["value"],
             }
             for row in rows

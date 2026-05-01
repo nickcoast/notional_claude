@@ -134,7 +134,9 @@ def get_portfolio_data_sync(
     (e.g. Streamlit session_state, or a future service layer) owns the lifetime.
 
     Returns (account_df, underlying_df, positions_by_underlying, health_dict).
-    health_dict is always returned, even on failure.
+    health_dict is always returned, even on failure.  Successful calls attach
+    contract_positions to health so the service can persist per-contract
+    history without a second IB lookup.
     """
     logger.info("Starting portfolio data retrieval")
     started_at = time.time()
@@ -197,6 +199,7 @@ def get_portfolio_data_sync(
             portfolio_items = [item for item in portfolio_items if getattr(item, 'account', '') == _acct]
 
         positions_by_underlying = {}
+        contract_positions = []
         position_errors = 0
 
         portfolio_by_account_conid = {}
@@ -551,6 +554,38 @@ def get_portfolio_data_sync(
                 total_option_contracts,
             )
 
+        def portfolio_average_cost(portfolio_item, position):
+            if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'averageCost', None)):
+                return float(portfolio_item.averageCost)
+            return safe_float_conversion(getattr(position, 'avgCost', None))
+
+        def append_contract_position(position, contract, market_price, market_value, portfolio_item, price_source):
+            contract_positions.append({
+                'account': getattr(position, 'account', ''),
+                'symbol': getattr(contract, 'symbol', ''),
+                'local_symbol': getattr(contract, 'localSymbol', ''),
+                'security_type': getattr(contract, 'secType', ''),
+                'con_id': int(safe_float_conversion(getattr(contract, 'conId', 0))),
+                'expiry': getattr(contract, 'lastTradeDateOrContractMonth', ''),
+                'strike': safe_float_conversion(getattr(contract, 'strike', None)),
+                'right': getattr(contract, 'right', ''),
+                'multiplier': safe_float_conversion(getattr(contract, 'multiplier', None)),
+                'quantity': safe_float_conversion(getattr(position, 'position', None)),
+                'market_price': market_price,
+                'market_value': market_value,
+                'average_cost': portfolio_average_cost(portfolio_item, position),
+                'unrealized_pnl': (
+                    safe_float_conversion(getattr(portfolio_item, 'unrealizedPNL', None))
+                    if portfolio_item is not None else None
+                ),
+                'realized_pnl': (
+                    safe_float_conversion(getattr(portfolio_item, 'realizedPNL', None))
+                    if portfolio_item is not None else None
+                ),
+                'currency': getattr(contract, 'currency', ''),
+                'price_source': price_source,
+            })
+
         for idx, pos in enumerate(positions, start=1):
             try:
                 contract = pos.contract
@@ -614,6 +649,17 @@ def get_portfolio_data_sync(
                             underlying_price_source.setdefault(underlying_symbol, "cost_basis")
 
                     positions_by_underlying[underlying_symbol]['stock_value'] += stock_market_value
+                    stock_market_price = None
+                    if pos.position != 0 and is_valid_number(stock_market_value):
+                        stock_market_price = abs(float(stock_market_value) / float(pos.position))
+                    append_contract_position(
+                        pos,
+                        contract,
+                        market_price=stock_market_price,
+                        market_value=stock_market_value,
+                        portfolio_item=portfolio_item,
+                        price_source=underlying_price_source.get(underlying_symbol),
+                    )
 
                     abs_qty = abs(float(pos.position))
                     avg_cost = safe_float_conversion(pos.avgCost)
@@ -673,6 +719,25 @@ def get_portfolio_data_sync(
                         option_actual_value = option_price * multiplier * pos.position
 
                     positions_by_underlying[underlying_symbol]['option_actual_value'] += option_actual_value
+                    option_market_price = None
+                    if (
+                        pos.position != 0
+                        and multiplier
+                        and is_valid_number(option_actual_value)
+                    ):
+                        option_market_price = float(option_actual_value) / (float(pos.position) * multiplier)
+                    append_contract_position(
+                        pos,
+                        contract,
+                        market_price=option_market_price,
+                        market_value=option_actual_value,
+                        portfolio_item=portfolio_item,
+                        price_source=(
+                            "ib_portfolio"
+                            if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'marketValue', None))
+                            else "option_market_data"
+                        ),
+                    )
             except Exception as position_error:
                 logger.warning(f"Error processing position {idx}: {position_error}")
                 position_errors += 1
@@ -868,6 +933,7 @@ def get_portfolio_data_sync(
             'farm_down_names': farm_down_names,
             'quote_issue_symbols': quote_issue_symbols,
             'fallback_symbols': sorted(fallback_symbols),
+            'contract_positions': contract_positions,
         }
         return account_df, underlying_df, positions_by_underlying, health
 

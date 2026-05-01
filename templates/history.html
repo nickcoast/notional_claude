@@ -60,11 +60,9 @@
                 Basis
                 <select id="compare-basis"
                         class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
-                    <option value="market_value" selected>Market value</option>
-                    <option value="npv">NPV</option>
+                    <option value="market_value" selected>Actual value</option>
                     <option value="stock_value">Stock value</option>
                     <option value="option_actual_value">Option actual</option>
-                    <option value="option_notional_value">Option notional</option>
                 </select>
             </label>
         </div>
@@ -96,14 +94,15 @@
                         <th class="text-left py-2 px-2 font-medium">Type</th>
                         <th class="text-right py-2 px-2 font-medium">Start</th>
                         <th class="text-right py-2 px-2 font-medium">End</th>
-                        <th class="text-right py-2 px-2 font-medium">Change</th>
+                        <th class="text-right py-2 px-2 font-medium">Contribution</th>
+                        <th class="text-right py-2 px-2 font-medium">Value Δ</th>
                         <th class="text-right py-2 px-2 font-medium">Qty Change</th>
                         <th class="text-right py-2 pl-2 font-medium">Price Change</th>
                     </tr>
                 </thead>
                 <tbody id="compare-body">
                     <tr>
-                        <td colspan="7" class="py-8 text-center text-gray-600">
+                        <td colspan="8" class="py-8 text-center text-gray-600">
                             Waiting for stored history.
                         </td>
                     </tr>
@@ -405,7 +404,7 @@
             drawChart();
 
             if (!state.selectedStartId || !state.selectedEndId || state.selectedStartId === state.selectedEndId) {
-                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">Select two different points.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">Select two different points.</td></tr>';
                 summaryEl.textContent = '';
                 return;
             }
@@ -419,7 +418,7 @@
             });
             const response = await fetch('/history/compare?' + params.toString());
             if (!response.ok) {
-                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">Comparison is not available for those points.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">Comparison is not available for those points.</td></tr>';
                 summaryEl.textContent = '';
                 return;
             }
@@ -437,7 +436,7 @@
 
             const rows = data.rows || [];
             if (!rows.length) {
-                bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">No position changes found.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">No position changes found for this level and range.</td></tr>';
                 return;
             }
 
@@ -450,6 +449,7 @@
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.start_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.end_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums font-semibold ' + deltaClass + '">' + money(row.delta_value) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-500">' + money(row.raw_value_delta) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + number(row.quantity_delta, 2) + '</td>'
                     + '<td class="py-1.5 pl-2 text-right tabular-nums text-gray-300">' + money(row.price_delta) + '</td>'
                     + '</tr>';
@@ -484,7 +484,7 @@
         window.addEventListener('resize', drawChart);
 
         loadHistory().catch(function () {
-            bodyEl.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-600">History is not available yet.</td></tr>';
+            bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">History is not available yet.</td></tr>';
         });
         setInterval(function () {
             loadHistory().catch(function () {});

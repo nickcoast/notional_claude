@@ -139,6 +139,62 @@ class TimeSeriesStoreTest(unittest.TestCase):
             sum(delta for _symbol, delta in expected),
         )
 
+    def test_symbol_comparison_adjusts_for_added_stock_flow(self):
+        first = {
+            "as_of": 1700000200.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "SYM300",
+                    "stock_count": 5.0,
+                    "underlying_market_price": 1137.8,
+                    "underlying_cost_basis": 1100.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 5689.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 5689.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": 1700000215.0,
+            "metrics": {"net_liquidation": 1025.0},
+            "positions": [
+                {
+                    "symbol": "SYM300",
+                    "stock_count": 20.0,
+                    "underlying_market_price": 1152.5,
+                    "underlying_cost_basis": 1141.6,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 23050.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 23050.0,
+                }
+            ],
+        }
+
+        first_id = self.store.insert_snapshot(first, "TEST_ACCOUNT")
+        second_id = self.store.insert_snapshot(second, "TEST_ACCOUNT")
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = comparison["rows"][0]
+        raw_delta = second["positions"][0]["stock_value"] - first["positions"][0]["stock_value"]
+        expected_contribution = (
+            5.0 * (1152.5 - 1137.8)
+            + 15.0 * (1152.5 - 1141.6)
+        )
+        self.assertAlmostEqual(row["raw_value_delta"], raw_delta)
+        self.assertAlmostEqual(row["flow_adjustment"], 15.0 * 1141.6)
+        self.assertAlmostEqual(row["delta_value"], expected_contribution)
+        self.assertEqual(row["contribution_source"], "flow_adjusted")
+
     def test_contract_level_comparison_uses_contract_marks(self):
         first = {
             "as_of": 1700000100.0,

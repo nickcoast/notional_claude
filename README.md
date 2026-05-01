@@ -59,13 +59,21 @@ orders use last trade when available; option orders prefer the bid/ask midpoint.
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days.
 
-The history page persists one SQLite row per successful poll. Account snapshots
-store Net Liquidation and other account-level metrics for charting; symbol-level
-position snapshots store market value, stock value, option actual value, option
-notional value, and NPV for change attribution. Contract-level portfolio marks
-from IB are stored separately so a future detail view can explain moves by
-individual stock or option contract. Daily high/low Net Liquidation values are
-also rolled up as snapshots arrive.
+The history page persists one SQLite row per successful poll. Restarting the app
+reloads the existing `history.sqlite3` data and appends new snapshots. Account
+snapshots store Net Liquidation and other account-level metrics for charting.
+Symbol-level position snapshots store actual market value (`stock_value +
+option_actual_value`), stock value, option actual value, option notional value,
+and NPV. The default History comparison uses actual value, because option
+notional is an exposure metric and does not directly explain NLV changes.
+
+History comparisons estimate each position's contribution to the selected NLV
+move. When quantity changes and a cost basis is available, the comparison
+subtracts estimated trade flow from raw market-value change so adding or
+reducing shares does not dominate the list purely because capital moved into or
+out of the position. Contract-level portfolio marks are also stored so later
+views can drill into individual stock or option contracts. Daily high/low Net
+Liquidation values are rolled up as snapshots arrive.
 
 ## Future work
 

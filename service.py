@@ -455,7 +455,9 @@ class IBPollingService:
             account_filter=self._selected_account,
         )
         open_orders = self._fetch_open_orders()
-        contract_positions = self._fetch_position_components()
+        contract_positions = []
+        if health:
+            contract_positions = health.pop("contract_positions", []) or []
         as_of = time.time()
 
         # Persist caches so last-known values survive a restart.
@@ -518,48 +520,6 @@ class IBPollingService:
             logger.warning("Failed to persist time-series snapshot: %s", exc, exc_info=True)
 
         logger.debug("Snapshot stored (as_of=%.1f, positions=%d)", as_of, len(snapshot["positions"]))
-
-    def _fetch_position_components(self) -> list[dict]:
-        """Fetch contract-level portfolio marks for time-series post-mortems."""
-        if not self.ib.isConnected():
-            return []
-
-        try:
-            portfolio_items = self.ib.portfolio() or []
-        except Exception as exc:
-            logger.warning("Failed to fetch portfolio items for history: %s", exc)
-            return []
-
-        positions = []
-        for item in portfolio_items:
-            contract = getattr(item, "contract", None)
-            account = getattr(item, "account", "")
-            if self._selected_account != "ALL" and account != self._selected_account:
-                continue
-            if contract is None:
-                continue
-
-            positions.append({
-                "account": account,
-                "symbol": getattr(contract, "symbol", ""),
-                "local_symbol": getattr(contract, "localSymbol", ""),
-                "security_type": getattr(contract, "secType", ""),
-                "con_id": int(safe_float_conversion(getattr(contract, "conId", 0))),
-                "expiry": getattr(contract, "lastTradeDateOrContractMonth", ""),
-                "strike": safe_float_conversion(getattr(contract, "strike", None)),
-                "right": getattr(contract, "right", ""),
-                "multiplier": safe_float_conversion(getattr(contract, "multiplier", None)),
-                "quantity": safe_float_conversion(getattr(item, "position", None)),
-                "market_price": safe_float_conversion(getattr(item, "marketPrice", None)),
-                "market_value": safe_float_conversion(getattr(item, "marketValue", None)),
-                "average_cost": safe_float_conversion(getattr(item, "averageCost", None)),
-                "unrealized_pnl": safe_float_conversion(getattr(item, "unrealizedPNL", None)),
-                "realized_pnl": safe_float_conversion(getattr(item, "realizedPNL", None)),
-                "currency": getattr(contract, "currency", ""),
-                "price_source": "ib_portfolio",
-            })
-
-        return positions
 
     def _fetch_open_orders(self) -> list[dict]:
         """Fetch and normalize open IB orders without trading side effects."""
