@@ -46,6 +46,8 @@ def safe_float_conversion(value_str):
         return 0.0
 
     if isinstance(value_str, str):
+        if not value_str.strip():
+            return 0.0
         clean_str = value_str.replace(locale.localeconv()['currency_symbol'], '')
         clean_str = clean_str.replace(',', '')
         try:

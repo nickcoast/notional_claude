@@ -48,9 +48,14 @@ The selection is saved back to `config.json` automatically.
 | `GET /debug/positions` | Per-contract position detail for verifying calculations |
 | `GET /stream` | SSE stream of raw JSON snapshots |
 
-The orders page is display-only. It reads open orders from `ib_insync`
-(`reqAllOpenOrders`, `reqOpenOrders`, and local `openTrades`) and does not
-submit, modify, or cancel trades.
+The orders page is display-only and does not submit, modify, or cancel trades.
+It reads open orders from `ib_insync` using local `openTrades` plus
+`reqAllOpenOrders` by default. The app never calls `placeOrder`, `cancelOrder`,
+or `reqGlobalCancel`. `IB_OPEN_ORDER_SCOPE=client` uses `reqOpenOrders`, which
+TWS may reject when API Read-Only mode is enabled because that request can bind
+manual TWS orders when used by client id `0`. This app uses a nonzero client id,
+but `reqAllOpenOrders` is still the better default for a read-only dashboard
+that needs to display orders placed outside this app.
 
 Open-order rows include a calculated `Away` percentage: the absolute distance
 between the actionable order price and current market reference price. Stock
@@ -131,3 +136,5 @@ database contents are not committed.
 |---|---|---|
 | `IB_POLL_INTERVAL` | `15` | Seconds between portfolio fetches (minimum 10) |
 | `IB_HISTORY_DB` | `history.sqlite3` | SQLite path for stored time-series history |
+| `IB_READONLY` | `1` | Tell `ib_insync` to avoid its startup order-sync requests; this is separate from TWS API Read-Only mode |
+| `IB_OPEN_ORDER_SCOPE` | `all` | Open-order query scope: `local`, `all`, or `client`; `all` uses `reqAllOpenOrders`, while `client` uses `reqOpenOrders` and may be rejected by TWS API Read-Only mode |

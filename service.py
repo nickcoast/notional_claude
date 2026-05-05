@@ -35,6 +35,33 @@ logger = logging.getLogger(__name__)
 DELTA_CACHE_FILE = Path("delta_cache.json")
 PRICE_CACHE_FILE = Path("price_cache.json")
 CONFIG_FILE = Path("config.json")
+TRUTHY_VALUES = {"1", "true", "yes", "on"}
+FALSY_VALUES = {"0", "false", "no", "off"}
+OPEN_ORDER_SCOPES = {"local", "client", "all"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in TRUTHY_VALUES:
+        return True
+    if normalized in FALSY_VALUES:
+        return False
+    logger.warning("Invalid boolean value for %s=%r; using %s", name, value, default)
+    return default
+
+
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in choices:
+        return normalized
+    logger.warning("Invalid value for %s=%r; using %s", name, value, default)
+    return default
 
 
 def _load_config() -> dict:
@@ -263,6 +290,8 @@ class IBPollingService:
         self.poll_interval = max(int(poll_interval), MIN_POLL_INTERVAL)
         history_db_path = os.getenv("IB_HISTORY_DB", str(DEFAULT_HISTORY_DB_FILE))
         self._history_store = TimeSeriesStore(history_db_path)
+        self._ib_readonly = _env_flag("IB_READONLY", True)
+        self._open_order_scope = _env_choice("IB_OPEN_ORDER_SCOPE", "all", OPEN_ORDER_SCOPES)
 
         self.ib = IB()
         self.ib.RequestTimeout = 20
@@ -414,8 +443,19 @@ class IBPollingService:
                 except Exception:
                     pass
                 client_id = random.randint(1000, 9999)
-                logger.info("Connecting to TWS (client_id=%d, attempt=%d)", client_id, attempt + 1)
-                self.ib.connect("127.0.0.1", 7497, clientId=client_id, timeout=10)
+                logger.info(
+                    "Connecting to TWS (client_id=%d, attempt=%d, readonly=%s)",
+                    client_id,
+                    attempt + 1,
+                    self._ib_readonly,
+                )
+                self.ib.connect(
+                    "127.0.0.1",
+                    7497,
+                    clientId=client_id,
+                    timeout=10,
+                    readonly=self._ib_readonly,
+                )
                 self.ib.reqMarketDataType(portfolio_module.PREFERRED_MARKET_DATA_TYPE)
                 portfolio_module.register_ib_error_handler(self.ib)
                 self._managed_accounts = list(self.ib.managedAccounts())
@@ -526,12 +566,14 @@ class IBPollingService:
         if not self.ib.isConnected():
             return []
 
+        getters = [("local open trades", self.ib.openTrades)]
+        if self._open_order_scope == "all":
+            getters.append(("all open orders", self.ib.reqAllOpenOrders))
+        elif self._open_order_scope == "client":
+            getters.append(("client open orders", self.ib.reqOpenOrders))
+
         trades = []
-        for label, getter in (
-            ("all open orders", self.ib.reqAllOpenOrders),
-            ("client open orders", self.ib.reqOpenOrders),
-            ("local open trades", self.ib.openTrades),
-        ):
+        for label, getter in getters:
             try:
                 trades.extend(getter() or [])
             except Exception as exc:
