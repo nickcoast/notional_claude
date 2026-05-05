@@ -45,6 +45,8 @@
 
     </div>
 
+    {% include "_news_modal.html" %}
+
     <script>
     // ── Table sort ────────────────────────────────────────────────────────────
     // Sort state lives here (outside the SSE-swapped div) so it survives
@@ -75,8 +77,10 @@
             const isNum = NUM_COLS.has(sortCol);
             const rows = Array.from(tbody.querySelectorAll('tr'));
             rows.sort(function (a, b) {
-                const rawA = (a.cells[sortCol] || {}).textContent || '';
-                const rawB = (b.cells[sortCol] || {}).textContent || '';
+                const cellA = a.cells[sortCol] || {};
+                const cellB = b.cells[sortCol] || {};
+                const rawA = cellA.dataset && cellA.dataset.sortValue != null ? cellA.dataset.sortValue : (cellA.textContent || '');
+                const rawB = cellB.dataset && cellB.dataset.sortValue != null ? cellB.dataset.sortValue : (cellB.textContent || '');
                 const va = isNum ? numVal(rawA.trim()) : rawA.trim().toLowerCase();
                 const vb = isNum ? numVal(rawB.trim()) : rawB.trim().toLowerCase();
                 return cmp(va, vb);

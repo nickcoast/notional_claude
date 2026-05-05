@@ -147,8 +147,19 @@
                         {%- elif pos.earnings_days <= 30 %} bg-amber-900/30
                         {%- endif -%}
                     {%- endif %}"
+                    data-sort-value="{{ pos.symbol }}"
                     {%- if pos.earnings_date %} title="Earnings: {{ pos.earnings_date }} (in {{ pos.earnings_days }} day{{ 's' if pos.earnings_days != 1 else '' }})"{% endif %}>
-                    {{ pos.symbol }}
+                    <span>{{ pos.symbol }}</span>
+                    <button type="button"
+                            class="ml-1 align-middle text-[10px] leading-none text-gray-500 hover:text-blue-300 border border-gray-700 hover:border-blue-700 rounded px-1"
+                            data-news-symbol="{{ pos.symbol }}"
+                            title="News for {{ pos.symbol }}"
+                            aria-label="News for {{ pos.symbol }}">
+                        <svg viewBox="0 0 16 16" class="inline h-3 w-3" aria-hidden="true">
+                            <path fill="none" stroke="currentColor" stroke-width="1.4" d="M2.5 3.5h11v9h-11zM5 6h6M5 8.5h6M5 11h3" />
+                        </svg><span class="{{ 'ml-1 text-blue-300' if pos.news_count is not none else 'hidden' }}"
+                                    data-news-count-for="{{ pos.symbol }}">{{ pos.news_count if pos.news_count is not none else '' }}</span>
+                    </button>
                 </td>
 
                 <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">

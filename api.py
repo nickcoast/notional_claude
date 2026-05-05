@@ -7,6 +7,8 @@ Run with:
 Configuration via environment variables:
     IB_POLL_INTERVAL   Seconds between portfolio fetches (default 15, min 10)
     IB_HISTORY_DB      SQLite path for stored history (default history.sqlite3)
+    IB_NEWS_PROVIDERS  Optional + separated IBKR API news provider codes
+    IB_NEWS_KEYWORDS   Optional comma-separated news keyword tags
 """
 
 import asyncio
@@ -18,7 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from service import DEFAULT_POLL_INTERVAL, IBPollingService
@@ -47,10 +49,21 @@ service = IBPollingService(poll_interval=poll_interval)
 
 app = FastAPI(title="IB Portfolio Service")
 
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<rect width="32" height="32" rx="6" fill="#0f172a"/>
+<path d="M7 22h18M9 18l5-5 4 4 5-7" fill="none" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
 
 # ── Jinja2 templates ──────────────────────────────────────────────────────────
 
 templates = Jinja2Templates(directory="templates")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico():
+    """Small inline favicon to avoid noisy browser 404s."""
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 
 def _filter_currency(value):
@@ -306,6 +319,40 @@ async def orders_json():
             status_code=503,
         )
     return data
+
+
+@app.get("/news/article.json")
+async def news_article_json(
+    provider_code: str = Query(...),
+    article_id: str = Query(...),
+):
+    """IBKR API news article body for a provider/article id pair."""
+    try:
+        return service.get_news_article(provider_code, article_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except TimeoutError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=504)
+    except Exception as exc:
+        logger.warning("news article request failed for %s/%s: %s", provider_code, article_id, exc)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/news/{symbol}.json")
+async def symbol_news_json(
+    symbol: str,
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Recent IBKR API news headlines for a stock symbol."""
+    try:
+        return service.get_symbol_news(symbol, limit=limit)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except TimeoutError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=504)
+    except Exception as exc:
+        logger.warning("news headline request failed for %s: %s", symbol, exc)
+        return JSONResponse({"error": str(exc)}, status_code=502)
 
 
 @app.get("/history.json")

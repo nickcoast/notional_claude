@@ -39,6 +39,8 @@ The selection is saved back to `config.json` automatically.
 | `GET /history` | Net Liquidation history and position-change UI |
 | `GET /snapshot` | Current portfolio snapshot (JSON) |
 | `GET /orders.json` | Current open orders snapshot (JSON) |
+| `GET /news/{symbol}.json` | Recent IBKR API news headlines for a symbol |
+| `GET /news/article.json` | IBKR API news article body by provider/article id |
 | `GET /history.json` | Stored Net Liquidation history points (JSON) |
 | `GET /history/compare` | Position value changes between two stored snapshots |
 | `GET /health` | IB connection and quote-quality diagnostics |
@@ -63,6 +65,21 @@ orders use last trade when available; option orders prefer the bid/ask midpoint.
 
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days.
+
+Portfolio and order symbols also include an `N` news button. Clicking it opens a
+symbol news drawer that lazily fetches recent IBKR API headlines, shows the
+headline count on the button, and fetches/caches the full article body only when
+a headline is selected. IBKR separates headline requests from article-body
+requests: headlines return provider code plus article id, and
+`reqNewsArticle` uses that pair to return the article body. Article type `0`
+is text or HTML; article type `1` is binary/PDF content encoded as text. API
+news requires IBKR API news entitlements, which may differ from TWS news
+subscriptions. Some provider headlines include metadata prefixes such as
+`{A:800015:L:en}`; the app keeps the raw headline in JSON but strips the prefix
+from the UI, displays the language code separately, converts headline timestamps
+to browser-local time, and marks near-duplicate headlines as similar. IBKR
+exposes a provider/article id for each article, but not a separate canonical
+"story update" id.
 
 The history page persists one SQLite row per successful poll. Restarting the app
 reloads the existing `history.sqlite3` data and appends new snapshots. Account
@@ -138,3 +155,6 @@ database contents are not committed.
 | `IB_HISTORY_DB` | `history.sqlite3` | SQLite path for stored time-series history |
 | `IB_READONLY` | `1` | Tell `ib_insync` to avoid its startup order-sync requests; this is separate from TWS API Read-Only mode |
 | `IB_OPEN_ORDER_SCOPE` | `all` | Open-order query scope: `local`, `all`, or `client`; `all` uses `reqAllOpenOrders`, while `client` uses `reqOpenOrders` and may be rejected by TWS API Read-Only mode |
+| `IB_NEWS_PROVIDERS` | auto | `+`-separated IBKR API news provider codes; defaults to subscribed providers returned by TWS |
+| `IB_NEWS_CACHE_TTL` | `300` | Seconds to cache headline and article-body responses |
+| `IB_NEWS_KEYWORDS` | empty | Comma-separated keywords to tag in news headlines and article bodies |

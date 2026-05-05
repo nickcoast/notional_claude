@@ -7,14 +7,18 @@ all IB calls stay confined to the polling thread's event loop.
 import json
 import logging
 import os
+import queue
 import random
+import re
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
+from difflib import SequenceMatcher
+from html import unescape
 from pathlib import Path
 from typing import Optional
 
-from ib_insync import IB
+from ib_insync import IB, Stock
 
 import portfolio as portfolio_module
 from earnings import EarningsCache
@@ -38,6 +42,11 @@ CONFIG_FILE = Path("config.json")
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 FALSY_VALUES = {"0", "false", "no", "off"}
 OPEN_ORDER_SCOPES = {"local", "client", "all"}
+DEFAULT_NEWS_CACHE_TTL = 300
+DEFAULT_NEWS_LIMIT = 20
+HEADLINE_TAG_RE = re.compile(r"^\{(?P<tag>[^}]*)\}\s*(?P<headline>.*)$")
+HEADLINE_SOURCE_RE = re.compile(r"\s+--\s+[^-]+$")
+HEADLINE_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -64,6 +73,17 @@ def _env_choice(name: str, default: str, choices: set[str]) -> str:
     return default
 
 
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(min(int(value), max_value), min_value)
+    except ValueError:
+        logger.warning("Invalid integer value for %s=%r; using %s", name, value, default)
+        return default
+
+
 def _load_config() -> dict:
     """Load config.json; creates it with defaults if missing or unreadable."""
     defaults = {"account_names": {}, "selected_account": "ALL"}
@@ -87,6 +107,48 @@ def _save_config(config: dict) -> None:
             json.dump(config, f, indent=2)
     except Exception as exc:
         logger.warning("Failed to save config: %s", exc)
+
+
+def _parse_headline(headline: str) -> dict:
+    """Split IBKR's optional headline metadata tag from display text."""
+    raw = headline or ""
+    match = HEADLINE_TAG_RE.match(raw)
+    tag = match.group("tag") if match else ""
+    display = unescape((match.group("headline") if match else raw).strip())
+    metadata = {}
+    for part in tag.split(":"):
+        if not part:
+            continue
+        if part in {"A", "L"}:
+            metadata[part] = ""
+        elif metadata:
+            last_key = next(reversed(metadata))
+            metadata[last_key] = part
+
+    return {
+        "raw": raw,
+        "display": display or raw,
+        "tag": tag,
+        "language": metadata.get("L", ""),
+        "attributes": metadata.get("A", ""),
+    }
+
+
+def _headline_similarity_key(headline: str) -> str:
+    """
+    Best-effort key for spotting near-duplicate provider updates.
+
+    IBKR exposes articleId for a specific article, but not a canonical "story"
+    id.  This key intentionally stays heuristic and display-only.
+    """
+    without_source = HEADLINE_SOURCE_RE.sub("", headline or "").lower()
+    words = HEADLINE_WORD_RE.findall(without_source)
+    stop_words = {
+        "a", "about", "after", "and", "as", "at", "by", "for", "from",
+        "in", "into", "of", "on", "the", "to", "with",
+    }
+    meaningful = [word for word in words if word not in stop_words]
+    return " ".join(meaningful)
 
 
 def _load_delta_cache() -> dict:
@@ -172,6 +234,7 @@ def _serialize_snapshot(
     health: dict,
     as_of: float,
     earnings: Optional[dict] = None,
+    news_counts: Optional[dict] = None,
     open_orders: Optional[list[dict]] = None,
 ) -> dict:
     """
@@ -197,6 +260,7 @@ def _serialize_snapshot(
         }
 
     earnings = earnings or {}
+    news_counts = news_counts or {}
     today = date.today()
 
     positions = []
@@ -239,6 +303,7 @@ def _serialize_snapshot(
                 entry["earnings_date"] = None
                 entry["earnings_days"] = None
 
+            entry["news_count"] = news_counts.get(sym)
             positions.append(entry)
 
     orders = []
@@ -258,6 +323,7 @@ def _serialize_snapshot(
         else:
             entry["earnings_date"] = None
             entry["earnings_days"] = None
+        entry["news_count"] = news_counts.get(sym)
         orders.append(entry)
 
     return {
@@ -292,6 +358,13 @@ class IBPollingService:
         self._history_store = TimeSeriesStore(history_db_path)
         self._ib_readonly = _env_flag("IB_READONLY", True)
         self._open_order_scope = _env_choice("IB_OPEN_ORDER_SCOPE", "all", OPEN_ORDER_SCOPES)
+        self._news_provider_override = os.getenv("IB_NEWS_PROVIDERS", "").strip()
+        self._news_cache_ttl = _env_int("IB_NEWS_CACHE_TTL", DEFAULT_NEWS_CACHE_TTL, 30, 86400)
+        self._news_keywords = [
+            keyword.strip().lower()
+            for keyword in os.getenv("IB_NEWS_KEYWORDS", "").split(",")
+            if keyword.strip()
+        ]
 
         self.ib = IB()
         self.ib.RequestTimeout = 20
@@ -303,6 +376,7 @@ class IBPollingService:
         self._stop_event = threading.Event()
         self._fetch_now = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        self._ib_task_queue: queue.Queue = queue.Queue()
 
         # Survive across poll cycles (mirrors session_state in the Streamlit app).
         # Delta cache is also pre-loaded from disk so last-known values are
@@ -310,6 +384,12 @@ class IBPollingService:
         self._option_delta_cache: dict = _load_delta_cache()
         self._underlying_price_cache: dict = _load_price_cache()
         self._earnings_cache = EarningsCache()
+        self._news_lock = threading.Lock()
+        self._news_cache: dict[str, dict] = {}
+        self._news_article_cache: dict[tuple[str, str], dict] = {}
+        self._news_providers: list[dict] = []
+        self._news_provider_codes: Optional[str] = None
+        self._news_contract_cache: dict[str, int] = {}
 
         config = _load_config()
         self._account_names: dict = config.get("account_names", {})
@@ -357,11 +437,50 @@ class IBPollingService:
         with self._lock:
             if self._snapshot is None:
                 return None
+            orders = []
+            for order in self._snapshot.get("orders", []):
+                entry = dict(order)
+                account = entry.get("account", "")
+                entry["account_display"] = self._account_names.get(account, account)
+                orders.append(entry)
             return {
                 "as_of": self._snapshot.get("as_of"),
-                "orders": list(self._snapshot.get("orders", [])),
+                "orders": orders,
                 "health": dict(self._snapshot.get("health", {})),
             }
+
+    def get_symbol_news(self, symbol: str, limit: int = DEFAULT_NEWS_LIMIT) -> dict:
+        """Return cached or freshly fetched IBKR news headlines for a symbol."""
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("symbol is required")
+        limit = max(1, min(int(limit), 100))
+
+        cached = self._cached_symbol_news(symbol, limit)
+        if cached is not None:
+            return cached
+
+        return self._call_on_ib_thread(lambda: self._fetch_symbol_news_ib(symbol, limit), timeout=30.0)
+
+    def get_news_article(self, provider_code: str, article_id: str) -> dict:
+        """Return cached or freshly fetched IBKR news article body."""
+        provider_code = (provider_code or "").strip()
+        article_id = (article_id or "").strip()
+        if not provider_code or not article_id:
+            raise ValueError("provider_code and article_id are required")
+
+        key = (provider_code, article_id)
+        with self._news_lock:
+            cached = self._news_article_cache.get(key)
+            if cached and time.time() - cached["fetched_at"] <= self._news_cache_ttl:
+                data = dict(cached["data"])
+                data["cached"] = True
+                return data
+
+        return self._call_on_ib_thread(
+            lambda: self._fetch_news_article_ib(provider_code, article_id),
+            timeout=30.0,
+        )
 
     def get_history(
         self,
@@ -400,6 +519,207 @@ class IBPollingService:
             level=level,
             limit=limit,
         )
+
+    def _cached_symbol_news(self, symbol: str, limit: int) -> Optional[dict]:
+        with self._news_lock:
+            cached = self._news_cache.get(symbol)
+            if not cached:
+                return None
+            if time.time() - cached["fetched_at"] > self._news_cache_ttl:
+                return None
+            data = dict(cached["data"])
+            headlines = list(data.get("headlines", []))
+            data["headlines"] = headlines[:limit]
+            data["count"] = len(headlines)
+            data["cached"] = True
+            return data
+
+    def _news_counts_snapshot(self) -> dict:
+        cutoff = time.time() - self._news_cache_ttl
+        with self._news_lock:
+            return {
+                symbol: len(item["data"].get("headlines", []))
+                for symbol, item in self._news_cache.items()
+                if item.get("fetched_at", 0) >= cutoff
+            }
+
+    def _call_on_ib_thread(self, func, timeout: float):
+        if threading.current_thread() is self._poll_thread:
+            return func()
+        if self._poll_thread is None or not self._poll_thread.is_alive():
+            raise RuntimeError("IB polling service is not running")
+
+        done = threading.Event()
+        task = {"func": func, "done": done, "result": None, "error": None}
+        self._ib_task_queue.put(task)
+        self._fetch_now.set()
+        if not done.wait(timeout=timeout):
+            raise TimeoutError("Timed out waiting for IB response")
+        if task["error"] is not None:
+            raise task["error"]
+        return task["result"]
+
+    def _drain_ib_tasks(self) -> None:
+        while True:
+            try:
+                task = self._ib_task_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                task["result"] = task["func"]()
+            except Exception as exc:
+                task["error"] = exc
+            finally:
+                task["done"].set()
+
+    def _news_provider_code_string(self) -> str:
+        if self._news_provider_override:
+            return self._news_provider_override
+        if self._news_provider_codes is not None:
+            return self._news_provider_codes
+
+        providers = self.ib.reqNewsProviders() or []
+        provider_rows = [
+            {
+                "code": getattr(provider, "code", "") or getattr(provider, "providerCode", ""),
+                "name": getattr(provider, "name", "") or getattr(provider, "providerName", ""),
+            }
+            for provider in providers
+        ]
+        provider_rows = [row for row in provider_rows if row["code"]]
+        self._news_providers = provider_rows
+        self._news_provider_codes = "+".join(row["code"] for row in provider_rows)
+        return self._news_provider_codes
+
+    def _news_contract_id(self, symbol: str) -> int:
+        con_id = self._news_contract_cache.get(symbol)
+        if con_id:
+            return con_id
+
+        contracts = self.ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
+        if not contracts:
+            raise ValueError(f"IB could not qualify stock contract for {symbol}")
+        con_id = int(getattr(contracts[0], "conId", 0) or 0)
+        if not con_id:
+            raise ValueError(f"IB did not return a contract id for {symbol}")
+        self._news_contract_cache[symbol] = con_id
+        return con_id
+
+    def _fetch_symbol_news_ib(self, symbol: str, limit: int) -> dict:
+        if not self.ib.isConnected():
+            raise RuntimeError("Not connected to TWS")
+
+        provider_codes = self._news_provider_code_string()
+        if not provider_codes:
+            data = {
+                "symbol": symbol,
+                "provider_codes": "",
+                "providers": list(self._news_providers),
+                "headlines": [],
+                "count": 0,
+                "cached": False,
+                "note": "No API news providers are available for this TWS user.",
+            }
+            self._store_symbol_news(symbol, data)
+            return data
+
+        con_id = self._news_contract_id(symbol)
+        articles = self.ib.reqHistoricalNews(con_id, provider_codes, "", "", limit, []) or []
+        headlines = []
+        for article in articles:
+            headline = getattr(article, "headline", "") or ""
+            parsed_headline = _parse_headline(headline)
+            published = getattr(article, "time", None)
+            if isinstance(published, datetime):
+                published_ts = published.timestamp()
+                published_text = published.isoformat(sep=" ", timespec="seconds")
+            else:
+                published_ts = None
+                published_text = str(published) if published else ""
+            headlines.append({
+                "time": published_text,
+                "timestamp": published_ts,
+                "provider_code": getattr(article, "providerCode", "") or "",
+                "article_id": getattr(article, "articleId", "") or "",
+                "headline": parsed_headline["display"],
+                "raw_headline": parsed_headline["raw"],
+                "headline_metadata": parsed_headline["tag"],
+                "headline_language": parsed_headline["language"],
+                "headline_attributes": parsed_headline["attributes"],
+                "headline_similarity_key": _headline_similarity_key(parsed_headline["display"]),
+                "keyword_matches": self._keyword_matches(parsed_headline["display"]),
+            })
+        self._annotate_similar_headlines(headlines)
+
+        data = {
+            "symbol": symbol,
+            "provider_codes": provider_codes,
+            "providers": list(self._news_providers),
+            "headlines": headlines,
+            "count": len(headlines),
+            "cached": False,
+            "note": "",
+        }
+        self._store_symbol_news(symbol, data)
+        return data
+
+    def _annotate_similar_headlines(self, headlines: list[dict]) -> None:
+        groups: list[dict] = []
+        for headline in headlines:
+            key = headline.get("headline_similarity_key", "")
+            group = None
+            for candidate in groups:
+                if (
+                    key
+                    and candidate["key"]
+                    and SequenceMatcher(None, key, candidate["key"]).ratio() >= 0.82
+                ):
+                    group = candidate
+                    break
+            if group is None:
+                group = {"key": key, "items": []}
+                groups.append(group)
+            group["items"].append(headline)
+
+        for index, group in enumerate(groups, start=1):
+            count = len(group["items"])
+            for item_index, headline in enumerate(group["items"], start=1):
+                headline["similar_group"] = index
+                headline["similar_count"] = count
+                headline["similar_index"] = item_index
+
+    def _store_symbol_news(self, symbol: str, data: dict) -> None:
+        with self._news_lock:
+            self._news_cache[symbol] = {
+                "fetched_at": time.time(),
+                "data": data,
+            }
+
+    def _fetch_news_article_ib(self, provider_code: str, article_id: str) -> dict:
+        if not self.ib.isConnected():
+            raise RuntimeError("Not connected to TWS")
+
+        article = self.ib.reqNewsArticle(provider_code, article_id, [])
+        article_type = int(getattr(article, "articleType", 0) or 0)
+        article_text = getattr(article, "articleText", "") or ""
+        data = {
+            "provider_code": provider_code,
+            "article_id": article_id,
+            "article_type": article_type,
+            "article_text": article_text,
+            "keyword_matches": self._keyword_matches(article_text),
+            "cached": False,
+        }
+        with self._news_lock:
+            self._news_article_cache[(provider_code, article_id)] = {
+                "fetched_at": time.time(),
+                "data": data,
+            }
+        return data
+
+    def _keyword_matches(self, text: str) -> list[str]:
+        normalized = (text or "").lower()
+        return [keyword for keyword in self._news_keywords if keyword in normalized]
 
     def get_accounts(self) -> dict:
         """Return account list and current selection (safe to call from any thread)."""
@@ -478,6 +798,7 @@ class IBPollingService:
                     if self._stop_event.is_set():
                         break
 
+                self._drain_ib_tasks()
                 self._fetch_and_store()
                 self._fetch_now.wait(timeout=self.poll_interval)
                 self._fetch_now.clear()
@@ -518,6 +839,7 @@ class IBPollingService:
         snapshot = _serialize_snapshot(
             account_df, underlying_df, health, as_of,
             earnings=self._earnings_cache.snapshot(),
+            news_counts=self._news_counts_snapshot(),
             open_orders=open_orders,
         )
         snapshot["account"] = self._selected_account
