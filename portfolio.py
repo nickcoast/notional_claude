@@ -1,7 +1,11 @@
 import logging
+import os
+import re
 import time
 import traceback
 from collections import deque
+from datetime import datetime, time as datetime_time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -34,7 +38,6 @@ CACHEABLE_UNDERLYING_SOURCES = {
     "portfolio",
     "portfolio_derived",
     "portfolio_value",
-    "option_greeks",
     "snapshot",
     "snapshot_retry",
     "stream_retry",
@@ -43,15 +46,81 @@ HIGH_CONFIDENCE_UNDERLYING_SOURCES = {
     "portfolio",
     "portfolio_derived",
     "portfolio_value",
-    "option_greeks",
 }
-RETRYABLE_UNDERLYING_SOURCES = {"unavailable", "snapshot", "snapshot_retry"}
+RETRYABLE_UNDERLYING_SOURCES = {
+    "unavailable",
+    "option_greeks",
+    "snapshot",
+    "snapshot_retry",
+}
 QUOTE_RETRY_MAX_ATTEMPTS = 6
 QUOTE_RETRY_COOLDOWN_SECONDS = 8
 QUOTE_RETRY_BATCH_SIZE = 6
 IB_CONNECTION_ERROR_CODES = {502, 504, 1100, 1101, 1102, 1300, 2110}
 IB_FARM_WARNING_CODES = {2103, 2104, 2105, 2106, 2157, 2158}
 IB_QUOTE_ERROR_CODES = {354}
+OPTION_EXERCISE_TIMEZONE = ZoneInfo("America/New_York")
+OPTION_EXERCISE_CUTOFF_ET = os.getenv("IB_OPTION_EXERCISE_CUTOFF_ET", "17:20")
+
+
+def option_expiry_date(expiry):
+    """Parse an IB option expiry string into a date, when it includes a day."""
+    match = re.search(r"\d{8}", str(expiry or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(0), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def option_exercise_cutoff_time():
+    """Return the configured exercise cutoff time in Eastern time."""
+    try:
+        hour_text, minute_text = OPTION_EXERCISE_CUTOFF_ET.split(":", 1)
+        return datetime_time(int(hour_text), int(minute_text))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid IB_OPTION_EXERCISE_CUTOFF_ET=%r; using 17:20",
+            OPTION_EXERCISE_CUTOFF_ET,
+        )
+        return datetime_time(17, 20)
+
+
+def option_intrinsic_floor_value(contract, underlying_price, quantity, multiplier, now_ts):
+    """Signed intrinsic value floor while an option is still exerciseable."""
+    expiry = option_expiry_date(getattr(contract, "lastTradeDateOrContractMonth", ""))
+    if expiry is None:
+        return None
+
+    now_et = datetime.fromtimestamp(now_ts, OPTION_EXERCISE_TIMEZONE)
+    cutoff_et = datetime.combine(
+        expiry,
+        option_exercise_cutoff_time(),
+        tzinfo=OPTION_EXERCISE_TIMEZONE,
+    )
+    if now_et > cutoff_et:
+        return None
+
+    price = safe_float_conversion(underlying_price)
+    strike = safe_float_conversion(getattr(contract, "strike", None))
+    qty = safe_float_conversion(quantity)
+    mult = safe_float_conversion(multiplier) or 100.0
+    if price <= 0 or strike <= 0 or qty == 0 or mult <= 0:
+        return None
+
+    right = str(getattr(contract, "right", "")).upper()
+    if right == "C":
+        intrinsic = max(price - strike, 0.0)
+    elif right == "P":
+        intrinsic = max(strike - price, 0.0)
+    else:
+        return None
+
+    if intrinsic <= 0:
+        return 0.0
+    floor_abs = intrinsic * mult * abs(qty)
+    return floor_abs if qty > 0 else -floor_abs
 
 # Process-lifetime state — survives Streamlit reruns because this module is
 # imported once per process, not re-executed on each rerun like the main script.
@@ -374,7 +443,13 @@ def get_portfolio_data_sync(
         def fetch_underlyings(symbols, wait_seconds, chunk_size, label, source_tag, only_missing=True):
             target_symbols = [s for s in symbols if s]
             if only_missing:
-                target_symbols = [s for s in target_symbols if s not in underlying_market_price_map]
+                target_symbols = [
+                    s for s in target_symbols
+                    if (
+                        s not in underlying_market_price_map
+                        or underlying_price_source.get(s) == "option_greeks"
+                    )
+                ]
             if not target_symbols:
                 return
 
@@ -404,7 +479,13 @@ def get_portfolio_data_sync(
                     stream_resolved.add(symbol)
 
             if only_missing:
-                snapshot_targets = [s for s in target_symbols if s not in underlying_market_price_map]
+                snapshot_targets = [
+                    s for s in target_symbols
+                    if (
+                        s not in underlying_market_price_map
+                        or underlying_price_source.get(s) == "option_greeks"
+                    )
+                ]
             else:
                 snapshot_targets = [s for s in target_symbols if s not in stream_resolved]
 
@@ -625,6 +706,8 @@ def get_portfolio_data_sync(
 
                     if stock_market_value is None:
                         known_market_price = underlying_market_price_map.get(underlying_symbol)
+                        if underlying_price_source.get(underlying_symbol) == "option_greeks":
+                            known_market_price = None
                         known_price_from_cache = False
                         if known_market_price is None:
                             known_market_price = merged_price_cache.get(underlying_symbol)
@@ -642,11 +725,8 @@ def get_portfolio_data_sync(
                                 )
 
                     if stock_market_value is None:
-                        fallback_cost = safe_float_conversion(pos.avgCost)
-                        stock_market_value = fallback_cost * pos.position
-                        if fallback_cost > 0:
-                            underlying_market_price_map.setdefault(underlying_symbol, fallback_cost)
-                            underlying_price_source.setdefault(underlying_symbol, "cost_basis")
+                        stock_market_value = 0.0
+                        underlying_price_source.setdefault(underlying_symbol, "unavailable")
 
                     positions_by_underlying[underlying_symbol]['stock_value'] += stock_market_value
                     stock_market_price = None
@@ -708,15 +788,43 @@ def get_portfolio_data_sync(
                         portfolio_item = portfolio_by_option_key_any.get(key)
 
                     option_actual_value = None
+                    option_value_source = "unavailable"
                     if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'marketValue', None)):
                         option_actual_value = float(portfolio_item.marketValue)
+                        option_value_source = "ib_portfolio"
 
                     if option_actual_value is None:
                         option_price = option_price_map.get(key)
-                        if option_price is None:
-                            avg_cost_total = safe_float_conversion(pos.avgCost)
-                            option_price = avg_cost_total / multiplier if multiplier else 0.0
-                        option_actual_value = option_price * multiplier * pos.position
+                        if option_price is not None:
+                            option_actual_value = option_price * multiplier * pos.position
+                            option_value_source = "option_market_data"
+                        else:
+                            option_actual_value = 0.0
+
+                    underlying_price_for_intrinsic = underlying_market_price_map.get(underlying_symbol)
+                    if (
+                        underlying_price_source.get(underlying_symbol) == "option_greeks"
+                        or not is_valid_number(underlying_price_for_intrinsic)
+                        or float(underlying_price_for_intrinsic) <= 0
+                    ):
+                        underlying_price_for_intrinsic = merged_price_cache.get(underlying_symbol)
+                    intrinsic_floor_value = option_intrinsic_floor_value(
+                        contract,
+                        underlying_price_for_intrinsic,
+                        pos.position,
+                        multiplier,
+                        now_ts,
+                    )
+                    if intrinsic_floor_value is not None:
+                        if (
+                            pos.position > 0
+                            and option_actual_value < intrinsic_floor_value
+                        ) or (
+                            pos.position < 0
+                            and option_actual_value > intrinsic_floor_value
+                        ):
+                            option_actual_value = intrinsic_floor_value
+                            option_value_source = "intrinsic_floor"
 
                     positions_by_underlying[underlying_symbol]['option_actual_value'] += option_actual_value
                     option_market_price = None
@@ -732,11 +840,7 @@ def get_portfolio_data_sync(
                         market_price=option_market_price,
                         market_value=option_actual_value,
                         portfolio_item=portfolio_item,
-                        price_source=(
-                            "ib_portfolio"
-                            if portfolio_item is not None and is_valid_number(getattr(portfolio_item, 'marketValue', None))
-                            else "option_market_data"
-                        ),
+                        price_source=option_value_source,
                     )
             except Exception as position_error:
                 logger.warning(f"Error processing position {idx}: {position_error}")
@@ -754,6 +858,11 @@ def get_portfolio_data_sync(
         for symbol, data in positions_by_underlying.items():
             try:
                 market_price = underlying_market_price_map.get(symbol)
+                if (
+                    underlying_price_source.get(symbol) == "option_greeks"
+                    and data['stock_count'] != 0
+                ):
+                    market_price = None
                 if not (is_valid_number(market_price) and float(market_price) > 0):
                     cached_price = merged_price_cache.get(symbol)
                     if is_valid_number(cached_price) and float(cached_price) > 0:
@@ -766,12 +875,6 @@ def get_portfolio_data_sync(
                         if derived_price > 0:
                             market_price = derived_price
                             underlying_price_source[symbol] = "derived"
-
-                if not (is_valid_number(market_price) and float(market_price) > 0):
-                    qty = data['underlying_cost_basis_qty']
-                    if qty > 0:
-                        market_price = data['underlying_cost_basis_sum'] / qty
-                        underlying_price_source[symbol] = "cost_basis"
 
                 if not (is_valid_number(market_price) and float(market_price) > 0):
                     market_price = 0.0
@@ -815,7 +918,7 @@ def get_portfolio_data_sync(
             fallback_symbols = [
                 row.get('Symbol')
                 for row in underlying_data
-                if row.get('Underlying Price Source') in ('cost_basis', 'unavailable')
+                if row.get('Underlying Price Source') == 'unavailable'
             ]
             if fallback_symbols:
                 logger.info(f"Fallback-priced symbols: {fallback_symbols}")

@@ -12,13 +12,14 @@ import random
 import re
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from html import unescape
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from ib_insync import IB, Stock
+from ib_insync import IB, ExecutionFilter, OrderStatus, Stock
 
 import portfolio as portfolio_module
 from earnings import EarningsCache
@@ -47,6 +48,11 @@ DEFAULT_NEWS_LIMIT = 20
 HEADLINE_TAG_RE = re.compile(r"^\{(?P<tag>[^}]*)\}\s*(?P<headline>.*)$")
 HEADLINE_SOURCE_RE = re.compile(r"\s+--\s+[^-]+$")
 HEADLINE_WORD_RE = re.compile(r"[a-z0-9]+")
+EXPIRATION_WARNING_TIMEZONE = ZoneInfo("America/New_York")
+DEFAULT_EXPIRATION_NEAR_PCT = 1.0
+DEFAULT_EXPIRATION_NEAR_ABS = 0.50
+ORDER_EPSILON = 1e-6
+DEFAULT_EXECUTION_BACKFILL_DAYS = 7
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -82,6 +88,60 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     except ValueError:
         logger.warning("Invalid integer value for %s=%r; using %s", name, value, default)
         return default
+
+
+def _env_float(name: str, default: float, min_value: float, max_value: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(min(float(value), max_value), min_value)
+    except ValueError:
+        logger.warning("Invalid float value for %s=%r; using %s", name, value, default)
+        return default
+
+
+def _expiry_date(expiry: str) -> Optional[date]:
+    match = re.search(r"\d{8}", str(expiry or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(0), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _normalized_order_fill(total_quantity, status, execution_filled=0.0) -> dict:
+    """Merge IB order status with executions and classify filled orders."""
+    total = safe_float_conversion(total_quantity)
+    status_text = getattr(status, "status", "") if status is not None else ""
+    status_filled = safe_float_conversion(getattr(status, "filled", 0))
+    status_remaining = safe_float_conversion(getattr(status, "remaining", 0))
+    exec_filled = safe_float_conversion(execution_filled)
+    filled = max(status_filled, exec_filled)
+
+    if total > 0:
+        remaining = max(total - filled, 0.0)
+    else:
+        remaining = max(status_remaining, 0.0)
+
+    is_filled = (
+        status_text in OrderStatus.DoneStates
+        or (total > 0 and filled >= total - ORDER_EPSILON)
+        or (total > 0 and remaining <= ORDER_EPSILON and filled > 0)
+    )
+    if is_filled:
+        status_text = "Filled"
+        if total > 0:
+            filled = max(filled, total)
+        remaining = 0.0
+
+    return {
+        "status": status_text,
+        "filled": filled,
+        "remaining": remaining,
+        "is_filled": is_filled,
+    }
 
 
 def _load_config() -> dict:
@@ -335,6 +395,84 @@ def _serialize_snapshot(
     }
 
 
+def _expiration_option_warnings(
+    snapshot: dict,
+    contract_positions: list[dict],
+    as_of: float,
+) -> list[dict]:
+    """Find same-day options that are ITM or close enough to demand attention."""
+    today_et = datetime.fromtimestamp(as_of, EXPIRATION_WARNING_TIMEZONE).date()
+    near_pct = _env_float(
+        "IB_EXPIRATION_WARNING_NEAR_PCT",
+        DEFAULT_EXPIRATION_NEAR_PCT,
+        0.0,
+        25.0,
+    ) / 100.0
+    near_abs = _env_float(
+        "IB_EXPIRATION_WARNING_NEAR_ABS",
+        DEFAULT_EXPIRATION_NEAR_ABS,
+        0.0,
+        1000.0,
+    )
+    prices = {
+        row.get("symbol"): safe_float_conversion(row.get("underlying_market_price"))
+        for row in snapshot.get("positions", [])
+        if row.get("symbol")
+    }
+    warnings = []
+    for contract in contract_positions:
+        if contract.get("security_type") != "OPT":
+            continue
+        quantity = safe_float_conversion(contract.get("quantity"))
+        if abs(quantity) < 1e-9:
+            continue
+        expiry = _expiry_date(contract.get("expiry"))
+        if expiry != today_et:
+            continue
+
+        symbol = contract.get("symbol", "")
+        underlying_price = prices.get(symbol)
+        strike = safe_float_conversion(contract.get("strike"))
+        multiplier = safe_float_conversion(contract.get("multiplier")) or 100.0
+        if underlying_price <= 0 or strike <= 0:
+            continue
+
+        right = str(contract.get("right") or "").upper()
+        if right == "C":
+            distance = underlying_price - strike
+        elif right == "P":
+            distance = strike - underlying_price
+        else:
+            continue
+
+        intrinsic_per_share = max(distance, 0.0)
+        near_threshold = max(near_abs, underlying_price * near_pct)
+        status = "ITM" if intrinsic_per_share > 0 else "NEAR"
+        if status == "NEAR" and abs(distance) > near_threshold:
+            continue
+
+        warnings.append({
+            "symbol": symbol,
+            "local_symbol": contract.get("local_symbol") or symbol,
+            "right": right,
+            "strike": strike,
+            "quantity": quantity,
+            "underlying_price": underlying_price,
+            "distance": distance,
+            "intrinsic_value": intrinsic_per_share * multiplier * abs(quantity),
+            "status": status,
+        })
+
+    warnings.sort(
+        key=lambda item: (
+            0 if item["status"] == "ITM" else 1,
+            -abs(item["intrinsic_value"]),
+            item["symbol"],
+        )
+    )
+    return warnings
+
+
 # ── Service ───────────────────────────────────────────────────────────────────
 
 class IBPollingService:
@@ -360,6 +498,12 @@ class IBPollingService:
         self._open_order_scope = _env_choice("IB_OPEN_ORDER_SCOPE", "all", OPEN_ORDER_SCOPES)
         self._news_provider_override = os.getenv("IB_NEWS_PROVIDERS", "").strip()
         self._news_cache_ttl = _env_int("IB_NEWS_CACHE_TTL", DEFAULT_NEWS_CACHE_TTL, 30, 86400)
+        self._execution_backfill_days = _env_int(
+            "IB_EXECUTION_BACKFILL_DAYS",
+            DEFAULT_EXECUTION_BACKFILL_DAYS,
+            0,
+            7,
+        )
         self._news_keywords = [
             keyword.strip().lower()
             for keyword in os.getenv("IB_NEWS_KEYWORDS", "").split(",")
@@ -383,7 +527,7 @@ class IBPollingService:
         # available immediately — including after a restart during market close.
         self._option_delta_cache: dict = _load_delta_cache()
         self._underlying_price_cache: dict = _load_price_cache()
-        self._earnings_cache = EarningsCache()
+        self._earnings_cache = EarningsCache(self._history_store)
         self._news_lock = threading.Lock()
         self._news_cache: dict[str, dict] = {}
         self._news_article_cache: dict[tuple[str, str], dict] = {}
@@ -395,6 +539,7 @@ class IBPollingService:
         self._account_names: dict = config.get("account_names", {})
         self._selected_account: str = config.get("selected_account", "ALL")
         self._managed_accounts: list = []
+        self._executions_backfilled = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -490,8 +635,14 @@ class IBPollingService:
         end_as_of: Optional[float] = None,
     ) -> dict:
         account_filter = account_filter or self._selected_account
+        account_display = (
+            "ALL"
+            if account_filter == "ALL"
+            else self._account_names.get(account_filter, account_filter)
+        )
         return {
             "account": account_filter,
+            "account_display": account_display,
             "points": self._history_store.get_net_liquidation_history(
                 account_filter=account_filter,
                 limit=limit,
@@ -809,13 +960,14 @@ class IBPollingService:
                 self._stop_event.wait(timeout=5)
 
     def _fetch_and_store(self):
+        self._backfill_executions_once()
         account_df, underlying_df, positions_by_underlying, health = portfolio_module.get_portfolio_data_sync(
             self.ib,
             option_delta_cache=self._option_delta_cache,
             underlying_price_cache=self._underlying_price_cache,
             account_filter=self._selected_account,
         )
-        open_orders = self._fetch_open_orders()
+        open_orders, executions = self._fetch_open_orders()
         contract_positions = []
         if health:
             contract_positions = health.pop("contract_positions", []) or []
@@ -843,6 +995,11 @@ class IBPollingService:
             open_orders=open_orders,
         )
         snapshot["account"] = self._selected_account
+        snapshot["expiration_option_warnings"] = _expiration_option_warnings(
+            snapshot,
+            contract_positions,
+            as_of,
+        )
 
         debug = None
         if positions_by_underlying:
@@ -878,22 +1035,50 @@ class IBPollingService:
                 account_filter=self._selected_account,
                 contract_positions=contract_positions,
             )
+            self._history_store.insert_order_snapshot(
+                as_of=as_of,
+                account_filter=self._selected_account,
+                orders=open_orders,
+            )
+            self._history_store.insert_executions(executions)
         except Exception as exc:
             logger.warning("Failed to persist time-series snapshot: %s", exc, exc_info=True)
 
         logger.debug("Snapshot stored (as_of=%.1f, positions=%d)", as_of, len(snapshot["positions"]))
 
-    def _fetch_open_orders(self) -> list[dict]:
+    def _backfill_executions_once(self) -> None:
+        """Persist recent executions once per service run, within TWS limits."""
+        if self._executions_backfilled or self._execution_backfill_days <= 0:
+            return
+        if not self.ib.isConnected():
+            return
+
+        since = datetime.now(timezone.utc) - timedelta(days=self._execution_backfill_days)
+        exec_filter = ExecutionFilter(time=since.strftime("%Y%m%d-%H:%M:%S"))
+        try:
+            fills = self.ib.reqExecutions(exec_filter) or []
+            records = [self._execution_record(fill) for fill in fills]
+            inserted = self._history_store.insert_executions(records)
+            logger.info(
+                "Backfilled %d execution rows from %d IB fills since %s",
+                inserted,
+                len(records),
+                exec_filter.time,
+            )
+            self._executions_backfilled = True
+        except Exception as exc:
+            logger.warning("Failed to backfill executions: %s", exc)
+
+    def _fetch_open_orders(self) -> tuple[list[dict], list[dict]]:
         """Fetch and normalize open IB orders without trading side effects."""
         if not self.ib.isConnected():
-            return []
+            return [], []
 
         getters = [("local open trades", self.ib.openTrades)]
         if self._open_order_scope == "all":
             getters.append(("all open orders", self.ib.reqAllOpenOrders))
         elif self._open_order_scope == "client":
             getters.append(("client open orders", self.ib.reqOpenOrders))
-
         trades = []
         for label, getter in getters:
             try:
@@ -911,8 +1096,26 @@ class IBPollingService:
             con_id = getattr(contract, "conId", None) if contract else None
             unique[(perm_id, order_id, con_id)] = (contract, order, status)
 
+        (
+            executions_by_perm_id,
+            executions_by_order_id,
+            execution_rows,
+            execution_records,
+        ) = self._fetch_execution_fill_totals()
         orders = []
         for contract, order, status in unique.values():
+            order_id = int(safe_float_conversion(getattr(order, "orderId", 0)))
+            perm_id = int(safe_float_conversion(getattr(order, "permId", 0)))
+            execution_filled = (
+                executions_by_perm_id.get(perm_id)
+                if perm_id
+                else executions_by_order_id.get(order_id, 0.0)
+            )
+            fill = _normalized_order_fill(
+                getattr(order, "totalQuantity", 0),
+                status,
+                execution_filled=execution_filled or 0.0,
+            )
             orders.append({
                 "symbol": getattr(contract, "symbol", "") if contract else "",
                 "local_symbol": getattr(contract, "localSymbol", "") if contract else "",
@@ -923,20 +1126,185 @@ class IBPollingService:
                 "limit_price": safe_float_conversion(getattr(order, "lmtPrice", 0)),
                 "aux_price": safe_float_conversion(getattr(order, "auxPrice", 0)),
                 "time_in_force": getattr(order, "tif", ""),
-                "status": getattr(status, "status", ""),
-                "filled": safe_float_conversion(getattr(status, "filled", 0)),
-                "remaining": safe_float_conversion(getattr(status, "remaining", 0)),
+                "status": fill["status"],
+                "filled": fill["filled"],
+                "remaining": fill["remaining"],
+                "is_filled": fill["is_filled"],
                 "account": getattr(order, "account", ""),
                 "exchange": getattr(contract, "exchange", "") if contract else "",
                 "currency": getattr(contract, "currency", "") if contract else "",
-                "order_id": int(safe_float_conversion(getattr(order, "orderId", 0))),
-                "perm_id": int(safe_float_conversion(getattr(order, "permId", 0))),
+                "order_id": order_id,
+                "perm_id": perm_id,
                 "parent_id": int(safe_float_conversion(getattr(order, "parentId", 0))),
             })
 
+        seen_order_keys = {
+            (
+                int(safe_float_conversion(getattr(order, "permId", 0))),
+                int(safe_float_conversion(getattr(order, "orderId", 0))),
+                getattr(contract, "conId", None) if contract else None,
+            )
+            for contract, order, _status in unique.values()
+        }
+        for key, row in execution_rows.items():
+            if key in seen_order_keys:
+                continue
+            orders.append(row)
+
         orders.sort(key=lambda item: (item.get("symbol") or "", item.get("order_id") or 0))
         self._annotate_order_price_distance(orders, unique.values())
-        return orders
+        return orders, execution_records
+
+    def _fetch_execution_fill_totals(
+        self,
+    ) -> tuple[dict[int, float], dict[int, float], dict[tuple, dict], list[dict]]:
+        """Return same-session execution totals and filled rows."""
+        fills = []
+        try:
+            fills.extend(self.ib.fills() or [])
+        except Exception as exc:
+            logger.debug("Failed to read cached executions: %s", exc)
+        try:
+            fills.extend(self.ib.reqExecutions() or [])
+        except Exception as exc:
+            logger.warning("Failed to fetch executions for order fill reconciliation: %s", exc)
+        try:
+            stored_records = self._history_store.get_recent_executions(
+                days=max(self._execution_backfill_days, 1),
+            )
+        except Exception as exc:
+            logger.debug("Failed to read stored executions: %s", exc)
+            stored_records = []
+
+        seen_exec_ids = set()
+        by_perm_id: dict[int, float] = {}
+        by_order_id: dict[int, float] = {}
+        execution_rows = {}
+        execution_records = []
+        records = [self._execution_record(fill) for fill in fills]
+        records.extend(stored_records)
+        for record in records:
+            exec_id = record.get("exec_id", "")
+            if exec_id and exec_id in seen_exec_ids:
+                continue
+            if exec_id:
+                seen_exec_ids.add(exec_id)
+            execution_records.append(record)
+
+            shares = safe_float_conversion(record.get("shares", 0))
+            if shares <= 0:
+                continue
+
+            perm_id = int(safe_float_conversion(record.get("perm_id", 0)))
+            order_id = int(safe_float_conversion(record.get("order_id", 0)))
+            if perm_id:
+                by_perm_id[perm_id] = by_perm_id.get(perm_id, 0.0) + shares
+            if order_id:
+                by_order_id[order_id] = by_order_id.get(order_id, 0.0) + shares
+
+            if not self._execution_is_today(record):
+                continue
+
+            con_id = record.get("con_id")
+            key = (perm_id, order_id, con_id)
+            entry = execution_rows.setdefault(
+                key,
+                {
+                    "symbol": record.get("symbol", ""),
+                    "local_symbol": record.get("local_symbol", ""),
+                    "security_type": record.get("security_type", ""),
+                    "action": self._execution_action(record.get("side", "")),
+                    "order_type": "FILL",
+                    "total_quantity": 0.0,
+                    "limit_price": 0.0,
+                    "aux_price": 0.0,
+                    "time_in_force": "",
+                    "status": "Filled",
+                    "filled": 0.0,
+                    "remaining": 0.0,
+                    "is_filled": True,
+                    "account": record.get("account", ""),
+                    "exchange": record.get("exchange", ""),
+                    "currency": record.get("currency", ""),
+                    "order_id": order_id,
+                    "perm_id": perm_id,
+                    "parent_id": 0,
+                    "_fill_notional": 0.0,
+                },
+            )
+            entry["filled"] += shares
+            entry["total_quantity"] += shares
+            entry["_fill_notional"] += shares * safe_float_conversion(record.get("price", 0))
+
+        for row in execution_rows.values():
+            if row["filled"] > 0:
+                row["current_price"] = row["_fill_notional"] / row["filled"]
+                row["order_price"] = row["current_price"]
+            row.pop("_fill_notional", None)
+        return by_perm_id, by_order_id, execution_rows, execution_records
+
+    @staticmethod
+    def _execution_is_today(record: dict) -> bool:
+        value = record.get("time")
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            text = str(value or "").strip()
+            parsed = None
+            for candidate in (
+                text,
+                text.replace("Z", "+00:00"),
+                text.replace(" ", "T", 1),
+            ):
+                try:
+                    parsed = datetime.fromisoformat(candidate)
+                    break
+                except ValueError:
+                    pass
+            if parsed is None:
+                for fmt in ("%Y%m%d %H:%M:%S", "%Y%m%d-%H:%M:%S"):
+                    try:
+                        parsed = datetime.strptime(text, fmt)
+                        break
+                    except ValueError:
+                        pass
+        if parsed is None:
+            return True
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.date() == date.today()
+
+    @staticmethod
+    def _execution_record(fill) -> dict:
+        execution = getattr(fill, "execution", fill)
+        contract = getattr(fill, "contract", None)
+        return {
+            "exec_id": getattr(execution, "execId", ""),
+            "time": getattr(execution, "time", ""),
+            "account": getattr(execution, "acctNumber", ""),
+            "symbol": getattr(contract, "symbol", "") if contract else "",
+            "local_symbol": getattr(contract, "localSymbol", "") if contract else "",
+            "security_type": getattr(contract, "secType", "") if contract else "",
+            "side": getattr(execution, "side", ""),
+            "shares": safe_float_conversion(getattr(execution, "shares", 0)),
+            "price": safe_float_conversion(getattr(execution, "price", 0)),
+            "avg_price": safe_float_conversion(getattr(execution, "avgPrice", 0)),
+            "order_id": int(safe_float_conversion(getattr(execution, "orderId", 0))),
+            "perm_id": int(safe_float_conversion(getattr(execution, "permId", 0))),
+            "client_id": int(safe_float_conversion(getattr(execution, "clientId", 0))),
+            "con_id": getattr(contract, "conId", None) if contract else None,
+            "exchange": getattr(execution, "exchange", ""),
+            "currency": getattr(contract, "currency", "") if contract else "",
+        }
+
+    @staticmethod
+    def _execution_action(side: str) -> str:
+        side = (side or "").upper()
+        if side == "BOT":
+            return "BUY"
+        if side == "SLD":
+            return "SELL"
+        return side
 
     def _annotate_order_price_distance(self, orders: list[dict], order_items) -> None:
         """Add current/reference prices and absolute percent distance to orders."""
@@ -952,6 +1320,11 @@ class IBPollingService:
 
         active = []
         for order in orders:
+            if order.get("is_filled"):
+                order.setdefault("order_price", None)
+                order.setdefault("current_price", None)
+                order.setdefault("price_distance_pct", None)
+                continue
             order_price = self._order_comparison_price(order)
             order["order_price"] = order_price
             order["current_price"] = None

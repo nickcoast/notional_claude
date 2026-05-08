@@ -17,26 +17,34 @@
             <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
                 IB History
             </h1>
-            <nav class="flex items-center gap-1 text-xs">
-                <a href="/"
-                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
-                <a href="/orders"
-                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Orders</a>
-                <a href="/history"
-                   class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">History</a>
-            </nav>
+            <div class="flex items-center gap-2">
+                <nav class="flex items-center gap-1 mr-3 text-xs">
+                    <a href="/"
+                       class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
+                    <a href="/orders"
+                       class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Orders</a>
+                    <a href="/history"
+                       class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">History</a>
+                </nav>
+                <select id="history-account-select"
+                        class="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 cursor-pointer">
+                    <option value="ALL">ALL</option>
+                </select>
+            </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-5 gap-3 mb-4">
+        <div class="grid grid-cols-1 lg:grid-cols-6 gap-3 mb-4">
             <label class="text-xs text-gray-500">
-                Window
-                <select id="history-limit"
-                        class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
-                    <option value="250">250 polls</option>
-                    <option value="1000" selected>1000 polls</option>
-                    <option value="5000">5000 polls</option>
-                    <option value="10000">10000 polls</option>
-                </select>
+                Start date
+                <input id="history-start-date"
+                       type="date"
+                       class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
+            </label>
+            <label class="text-xs text-gray-500">
+                End date
+                <input id="history-end-date"
+                       type="date"
+                       class="mt-1 w-full bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-200">
             </label>
             <label class="text-xs text-gray-500">
                 Start point
@@ -91,18 +99,20 @@
                 <thead>
                     <tr class="text-gray-500 border-b border-gray-700">
                         <th class="text-left py-2 pr-4 font-medium">Position</th>
-                        <th class="text-left py-2 px-2 font-medium">Type</th>
                         <th class="text-right py-2 px-2 font-medium">Start</th>
                         <th class="text-right py-2 px-2 font-medium">End</th>
                         <th class="text-right py-2 px-2 font-medium">Contribution</th>
                         <th class="text-right py-2 px-2 font-medium">Value Δ</th>
-                        <th class="text-right py-2 px-2 font-medium">Qty Change</th>
-                        <th class="text-right py-2 pl-2 font-medium">Price Change</th>
+                        <th class="text-right py-2 px-2 font-medium">Stock Δ</th>
+                        <th class="text-right py-2 px-2 font-medium">Option Δ</th>
+                        <th class="text-right py-2 px-2 font-medium">Qty Δ</th>
+                        <th class="text-right py-2 px-2 font-medium">Price Δ</th>
+                        <th class="text-left py-2 pl-2 font-medium">Type</th>
                     </tr>
                 </thead>
                 <tbody id="compare-body">
                     <tr>
-                        <td colspan="8" class="py-8 text-center text-gray-600">
+                        <td colspan="10" class="py-8 text-center text-gray-600">
                             Waiting for stored history.
                         </td>
                     </tr>
@@ -122,7 +132,9 @@
 
         const canvas = document.getElementById('nlv-chart');
         const ctx = canvas.getContext('2d');
-        const limitEl = document.getElementById('history-limit');
+        const accountSelectEl = document.getElementById('history-account-select');
+        const startDateEl = document.getElementById('history-start-date');
+        const endDateEl = document.getElementById('history-end-date');
         const startEl = document.getElementById('start-point');
         const endEl = document.getElementById('end-point');
         const levelEl = document.getElementById('compare-level');
@@ -163,6 +175,46 @@
             });
         }
 
+        function dateInputValue(date) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return year + '-' + month + '-' + day;
+        }
+
+        function setDefaultDateRange() {
+            if (startDateEl.value || endDateEl.value) return;
+            const today = new Date();
+            startDateEl.value = dateInputValue(today);
+            endDateEl.value = dateInputValue(today);
+        }
+
+        function selectedDateRangeParams() {
+            const params = new URLSearchParams({ limit: '10000' });
+            if (startDateEl.value) {
+                params.set(
+                    'start_as_of',
+                    String(new Date(startDateEl.value + 'T00:00:00').getTime() / 1000)
+                );
+            }
+            if (endDateEl.value) {
+                params.set(
+                    'end_as_of',
+                    String(new Date(endDateEl.value + 'T23:59:59.999').getTime() / 1000)
+                );
+            }
+            return params;
+        }
+
+        function selectedAccount() {
+            return accountSelectEl.value || 'ALL';
+        }
+
+        function selectedAccountDisplay() {
+            const option = accountSelectEl.options[accountSelectEl.selectedIndex];
+            return option ? option.textContent : selectedAccount();
+        }
+
         function esc(text) {
             return String(text == null ? '' : text)
                 .replace(/&/g, '&amp;')
@@ -170,6 +222,20 @@
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
+        }
+
+        function positionCell(row, isReconciliation) {
+            const label = esc(row.label || row.symbol);
+            const note = esc(row.note || '');
+            const cls = isReconciliation ? 'text-gray-400' : 'text-white';
+            if (!isReconciliation || !note) {
+                return '<td class="py-1.5 pr-4 font-bold ' + cls + '">' + label + '</td>';
+            }
+            return '<td class="py-1.5 pr-4 font-bold ' + cls + '" title="' + note + '">'
+                + '<button type="button" class="text-left hover:text-gray-200"'
+                + ' data-info-title="Other" data-info-body="' + note + '" aria-label="' + note + '">'
+                + label + '<span class="ml-1 text-[10px] border border-gray-700 rounded px-1 text-gray-500">i</span>'
+                + '</button></td>';
         }
 
         function pointById(id) {
@@ -377,12 +443,16 @@
         }
 
         async function loadHistory() {
-            const response = await fetch('/history.json?limit=' + encodeURIComponent(limitEl.value));
+            setDefaultDateRange();
+            const params = selectedDateRangeParams();
+            params.set('account', selectedAccount());
+            const response = await fetch('/history.json?' + params.toString());
             if (!response.ok) throw new Error('history fetch failed');
             const data = await response.json();
             state.points = data.points || [];
             state.account = data.account || '-';
-            accountEl.textContent = state.account;
+            accountEl.textContent = data.account_display || selectedAccountDisplay();
+            accountEl.title = state.account;
 
             const latest = (data.daily_extremes || [])[data.daily_extremes.length - 1];
             extremesEl.textContent = latest
@@ -404,7 +474,7 @@
             drawChart();
 
             if (!state.selectedStartId || !state.selectedEndId || state.selectedStartId === state.selectedEndId) {
-                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">Select two different points.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="10" class="py-8 text-center text-gray-600">Select two different points.</td></tr>';
                 summaryEl.textContent = '';
                 return;
             }
@@ -412,13 +482,14 @@
             const params = new URLSearchParams({
                 start_id: state.selectedStartId,
                 end_id: state.selectedEndId,
+                account: selectedAccount(),
                 level: levelEl.value,
                 basis: basisEl.value,
                 limit: '100',
             });
             const response = await fetch('/history/compare?' + params.toString());
             if (!response.ok) {
-                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">Comparison is not available for those points.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="10" class="py-8 text-center text-gray-600">Comparison is not available for those points.</td></tr>';
                 summaryEl.textContent = '';
                 return;
             }
@@ -437,7 +508,7 @@
 
             const rows = data.rows || [];
             if (!rows.length) {
-                bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">No position changes found for this level and range.</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="10" class="py-8 text-center text-gray-600">No position changes found for this level and range.</td></tr>';
                 return;
             }
 
@@ -446,14 +517,16 @@
                 const deltaClass = delta < 0 ? 'text-red-400' : delta > 0 ? 'text-emerald-400' : 'text-gray-300';
                 const isReconciliation = row.contribution_source === 'reconciliation';
                 return '<tr class="border-b border-gray-800/60 hover:bg-gray-800/30">'
-                    + '<td class="py-1.5 pr-4 font-bold ' + (isReconciliation ? 'text-gray-400' : 'text-white') + '">' + esc(row.label || row.symbol) + '</td>'
-                    + '<td class="py-1.5 px-2 text-gray-500">' + esc(row.security_type || '-') + '</td>'
+                    + positionCell(row, isReconciliation)
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.start_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.end_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums font-semibold ' + deltaClass + '">' + money(row.delta_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-500">' + money(row.raw_value_delta) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-400">' + money(row.stock_delta_value) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-400">' + money(row.option_actual_delta_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + number(row.quantity_delta, 2) + '</td>'
-                    + '<td class="py-1.5 pl-2 text-right tabular-nums text-gray-300">' + money(row.price_delta) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.price_delta) + '</td>'
+                    + '<td class="py-1.5 pl-2 text-gray-500">' + esc(row.security_type || '-') + '</td>'
                     + '</tr>';
             }).join('');
         }
@@ -481,17 +554,38 @@
         [startEl, endEl, levelEl, basisEl].forEach(function (el) {
             el.addEventListener('change', compareSelected);
         });
-        limitEl.addEventListener('change', loadHistory);
+        accountSelectEl.addEventListener('change', function () {
+            state.selectedStartId = null;
+            state.selectedEndId = null;
+            loadHistory().catch(function () {});
+        });
+        startDateEl.addEventListener('change', loadHistory);
+        endDateEl.addEventListener('change', loadHistory);
         compareButton.addEventListener('click', compareSelected);
         window.addEventListener('resize', drawChart);
 
-        loadHistory().catch(function () {
-            bodyEl.innerHTML = '<tr><td colspan="8" class="py-8 text-center text-gray-600">History is not available yet.</td></tr>';
+        fetch('/accounts').then(function (response) {
+            return response.json();
+        }).then(function (data) {
+            accountSelectEl.innerHTML = '';
+            (data.accounts || [{ id: 'ALL', name: 'ALL' }]).forEach(function (account) {
+                const option = document.createElement('option');
+                option.value = account.id;
+                option.textContent = account.name;
+                if (account.id === data.selected) option.selected = true;
+                accountSelectEl.appendChild(option);
+            });
+            return loadHistory();
+        }).catch(function () {
+            return loadHistory();
+        }).catch(function () {
+            bodyEl.innerHTML = '<tr><td colspan="10" class="py-8 text-center text-gray-600">History is not available yet.</td></tr>';
         });
         setInterval(function () {
             loadHistory().catch(function () {});
         }, 15000);
     }());
     </script>
+    {% include "_info_modal.html" %}
 </body>
 </html>

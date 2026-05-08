@@ -35,7 +35,8 @@
         </thead>
         <tbody>
             {% for order in snapshot.orders | sort(attribute='symbol') %}
-            <tr class="border-b border-gray-800/60 hover:bg-gray-800/30">
+            <tr class="border-b border-gray-800/60 hover:bg-gray-800/30"
+                data-order-filled="{{ 'true' if order.is_filled else 'false' }}">
                 <td class="py-1.5 pr-4 text-left font-bold text-white
                     {%- if order.earnings_days is not none -%}
                         {%- if order.earnings_days <= 3 %} bg-red-900/70
@@ -44,7 +45,11 @@
                         {%- endif -%}
                     {%- endif %}"
                     data-sort-value="{{ order.symbol or '' }}"
-                    {%- if order.earnings_date %} title="Earnings: {{ order.earnings_date }} (in {{ order.earnings_days }} day{{ 's' if order.earnings_days != 1 else '' }})"{% endif %}>
+                    {%- if order.earnings_date %}
+                    title="Earnings: {{ order.earnings_date }} (in {{ order.earnings_days }} day{{ 's' if order.earnings_days != 1 else '' }})"
+                    data-info-title="Earnings: {{ order.symbol }}"
+                    data-info-body="{{ order.symbol }} reports earnings on {{ order.earnings_date }} (in {{ order.earnings_days }} day{{ 's' if order.earnings_days != 1 else '' }})."
+                    {%- endif %}>
                     <span>{{ order.symbol or '—' }}</span>
                     {% if order.symbol %}
                     <button type="button"
@@ -83,9 +88,11 @@
                     {{ (order.price_distance_pct | number(2)) ~ '%' if order.price_distance_pct is not none else '—' }}
                 </td>
                 <td class="py-1.5 px-2 text-left text-gray-300">{{ order.time_in_force or '—' }}</td>
-                <td class="py-1.5 px-2 text-left text-gray-300">{{ order.status or '—' }}</td>
-                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">{{ order.filled | number(2) }}</td>
-                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300">{{ order.remaining | number(2) }}</td>
+                <td class="py-1.5 px-2 text-left {{ 'text-gray-500' if order.is_filled else 'text-gray-300' }}">{{ order.status or '—' }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300"
+                    data-sort-value="{{ order.filled or 0 }}">{{ order.filled | number(0) }}</td>
+                <td class="py-1.5 px-2 text-right tabular-nums text-gray-300"
+                    data-sort-value="{{ order.remaining or 0 }}">{{ order.remaining | number(0) }}</td>
                 <td class="py-1.5 pl-4 text-left text-gray-500"
                     data-sort-value="{{ order.account_display or order.account or '' }}"
                     {%- if order.account and order.account_display and order.account_display != order.account %} title="{{ order.account }}"{% endif %}>
@@ -94,11 +101,14 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
-</div>
-{% else %}
-<div class="py-12 text-center text-sm text-gray-600">
-    No open orders returned by IB.
+	    </table>
+	</div>
+	<div data-filled-filter-empty class="hidden py-10 text-center text-sm text-gray-600">
+	    Only filled orders are currently hidden.
+	</div>
+	{% else %}
+	<div class="py-12 text-center text-sm text-gray-600">
+	    No open orders returned by IB.
 </div>
 {% endif %}
 

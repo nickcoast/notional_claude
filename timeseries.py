@@ -1,23 +1,30 @@
 """
-SQLite-backed time-series storage for account and position snapshots.
+SQLite-backed time-series storage for account, position, and order data.
 
 The polling service writes one row per successful poll cycle.  The schema keeps
 both account-level metrics for NLV charting and position-level marks for later
-post-mortems on what changed between two points in time.
+post-mortems on what changed between two points in time.  Order snapshots and
+execution fills live in the same DB so completed order state can be reconciled
+without relying only on the current TWS session.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, time as datetime_time
 from pathlib import Path
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_HISTORY_DB_FILE = Path("history.sqlite3")
+OPTION_EXERCISE_TIMEZONE = ZoneInfo("America/New_York")
+OPTION_EXERCISE_CUTOFF_ET = os.getenv("IB_OPTION_EXERCISE_CUTOFF_ET", "17:20")
 
 ACCOUNT_METRIC_COLUMNS = (
     "net_liquidation",
@@ -73,6 +80,118 @@ def _json_loads_dict(data: Optional[str]) -> dict:
     except (TypeError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _is_option_cost_basis_fallback(row) -> bool:
+    """Detect old option rows where avg cost was stored as market price."""
+    security_type = (row["security_type"] or "").upper()
+    if security_type != "OPT":
+        return False
+    market_price = _float_or_none(row["market_price"])
+    average_cost = _float_or_none(row["average_cost"])
+    multiplier = _float_or_none(row["multiplier"]) or 100.0
+    if market_price is None or average_cost is None or multiplier <= 0:
+        return False
+    expected_price = average_cost / multiplier
+    tolerance = max(0.000001, abs(expected_price) * 0.000001)
+    return abs(market_price - expected_price) <= tolerance
+
+
+def _sanitized_contract_market_value(
+    row,
+    underlying_price: Optional[float] = None,
+    as_of: Optional[float] = None,
+) -> Optional[float]:
+    """Return contract market value with bad fallbacks removed and floors applied."""
+    price_source = (row["price_source"] or "").lower()
+    if price_source == "cost_basis" or _is_option_cost_basis_fallback(row):
+        value = 0.0
+    else:
+        value = _float_or_none(row["value"])
+
+    intrinsic_floor = _contract_intrinsic_floor_value(row, underlying_price, as_of)
+    if intrinsic_floor is None:
+        return value
+    if value is None:
+        value = 0.0
+    quantity = _float_or_none(row["quantity"]) or 0.0
+    if quantity > 0 and value < intrinsic_floor:
+        return intrinsic_floor
+    if quantity < 0 and value > intrinsic_floor:
+        return intrinsic_floor
+    return value
+
+
+def _option_expiry_date(expiry):
+    match = re.search(r"\d{8}", str(expiry or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(0), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _option_exercise_cutoff_time():
+    try:
+        hour_text, minute_text = OPTION_EXERCISE_CUTOFF_ET.split(":", 1)
+        return datetime_time(int(hour_text), int(minute_text))
+    except (TypeError, ValueError):
+        return datetime_time(17, 20)
+
+
+def _contract_intrinsic_floor_value(row, underlying_price, as_of):
+    if (row["security_type"] or "").upper() != "OPT":
+        return None
+    expiry = _option_expiry_date(row["expiry"])
+    if expiry is None:
+        return None
+
+    as_of_ts = _float_or_none(as_of if as_of is not None else row["as_of"])
+    if as_of_ts is None:
+        return None
+    as_of_et = datetime.fromtimestamp(as_of_ts, OPTION_EXERCISE_TIMEZONE)
+    cutoff_et = datetime.combine(
+        expiry,
+        _option_exercise_cutoff_time(),
+        tzinfo=OPTION_EXERCISE_TIMEZONE,
+    )
+    if as_of_et > cutoff_et:
+        return None
+
+    price = _float_or_none(underlying_price)
+    strike = _float_or_none(row["strike"])
+    quantity = _float_or_none(row["quantity"]) or 0.0
+    multiplier = _float_or_none(row["multiplier"]) or 100.0
+    if price is None or price <= 0 or strike is None or strike <= 0:
+        return None
+    if quantity == 0 or multiplier <= 0:
+        return None
+
+    right = (row["right"] or "").upper()
+    if right == "C":
+        intrinsic = max(price - strike, 0.0)
+    elif right == "P":
+        intrinsic = max(strike - price, 0.0)
+    else:
+        return None
+
+    if intrinsic <= 0:
+        return 0.0
+    floor_abs = intrinsic * multiplier * abs(quantity)
+    return floor_abs if quantity > 0 else -floor_abs
+
+
+RELIABLE_UNDERLYING_PRICE_SOURCES = {
+    "portfolio",
+    "portfolio_derived",
+    "portfolio_value",
+    "snapshot",
+    "snapshot_retry",
+    "stream_retry",
+    "cached",
+    "derived",
+}
 
 
 class TimeSeriesStore:
@@ -182,6 +301,81 @@ class TimeSeriesStore:
                     PRIMARY KEY(day, account_filter)
                 );
 
+                CREATE TABLE IF NOT EXISTS order_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    as_of REAL NOT NULL,
+                    account_filter TEXT NOT NULL,
+                    order_key TEXT NOT NULL,
+                    account TEXT,
+                    symbol TEXT,
+                    local_symbol TEXT,
+                    security_type TEXT,
+                    action TEXT,
+                    order_type TEXT,
+                    total_quantity REAL,
+                    limit_price REAL,
+                    aux_price REAL,
+                    time_in_force TEXT,
+                    status TEXT,
+                    filled REAL,
+                    remaining REAL,
+                    is_filled INTEGER NOT NULL DEFAULT 0,
+                    exchange TEXT,
+                    currency TEXT,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    parent_id INTEGER,
+                    current_price REAL,
+                    order_price REAL,
+                    price_distance_pct REAL,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(account_filter, as_of, order_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS executions (
+                    exec_id TEXT PRIMARY KEY,
+                    time TEXT,
+                    account TEXT,
+                    symbol TEXT,
+                    local_symbol TEXT,
+                    security_type TEXT,
+                    side TEXT,
+                    shares REAL,
+                    price REAL,
+                    avg_price REAL,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    client_id INTEGER,
+                    con_id INTEGER,
+                    exchange TEXT,
+                    currency TEXT,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS earnings_dates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    earnings_date TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'yfinance',
+                    first_seen_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    fetched_at REAL NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, earnings_date, source)
+                );
+
+                CREATE TABLE IF NOT EXISTS earnings_fetch_state (
+                    symbol TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'yfinance',
+                    earnings_date TEXT,
+                    fetched_at REAL NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(symbol, source)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_account_snapshots_account_asof
                     ON account_snapshots(account_filter, as_of);
                 CREATE INDEX IF NOT EXISTS idx_position_snapshots_lookup
@@ -190,6 +384,16 @@ class TimeSeriesStore:
                     ON contract_snapshots(account_snapshot_id, position_key);
                 CREATE INDEX IF NOT EXISTS idx_daily_extremes_account_day
                     ON daily_account_extremes(account_filter, day);
+                CREATE INDEX IF NOT EXISTS idx_order_snapshots_account_asof
+                    ON order_snapshots(account_filter, as_of);
+                CREATE INDEX IF NOT EXISTS idx_order_snapshots_order
+                    ON order_snapshots(perm_id, order_id);
+                CREATE INDEX IF NOT EXISTS idx_executions_time
+                    ON executions(time);
+                CREATE INDEX IF NOT EXISTS idx_executions_order
+                    ON executions(perm_id, order_id);
+                CREATE INDEX IF NOT EXISTS idx_earnings_dates_symbol_date
+                    ON earnings_dates(symbol, earnings_date);
                 """
             )
             conn.commit()
@@ -246,6 +450,220 @@ class TimeSeriesStore:
             )
             conn.commit()
             return snapshot_id
+
+    def insert_order_snapshot(
+        self,
+        as_of: float,
+        account_filter: str,
+        orders: Iterable[dict],
+    ) -> int:
+        """Persist normalized order rows observed during one poll cycle."""
+        as_of_value = _float_or_none(as_of)
+        if as_of_value is None:
+            return 0
+
+        rows = []
+        for order in orders:
+            rows.append(
+                (
+                    as_of_value,
+                    account_filter or "ALL",
+                    self._order_snapshot_key(order),
+                    _text_or_none(order.get("account")),
+                    _text_or_none(order.get("symbol")),
+                    _text_or_none(order.get("local_symbol")),
+                    _text_or_none(order.get("security_type")),
+                    _text_or_none(order.get("action")),
+                    _text_or_none(order.get("order_type")),
+                    _float_or_none(order.get("total_quantity")),
+                    _float_or_none(order.get("limit_price")),
+                    _float_or_none(order.get("aux_price")),
+                    _text_or_none(order.get("time_in_force")),
+                    _text_or_none(order.get("status")),
+                    _float_or_none(order.get("filled")),
+                    _float_or_none(order.get("remaining")),
+                    1 if order.get("is_filled") else 0,
+                    _text_or_none(order.get("exchange")),
+                    _text_or_none(order.get("currency")),
+                    _int_or_none(order.get("order_id")),
+                    _int_or_none(order.get("perm_id")),
+                    _int_or_none(order.get("parent_id")),
+                    _float_or_none(order.get("current_price")),
+                    _float_or_none(order.get("order_price")),
+                    _float_or_none(order.get("price_distance_pct")),
+                    _json_dumps(order),
+                )
+            )
+
+        if not rows:
+            return 0
+
+        with self._connection() as conn:
+            cursor = conn.executemany(
+                """
+                INSERT OR IGNORE INTO order_snapshots (
+                    as_of, account_filter, order_key, account, symbol, local_symbol,
+                    security_type, action, order_type, total_quantity, limit_price,
+                    aux_price, time_in_force, status, filled, remaining, is_filled,
+                    exchange, currency, order_id, perm_id, parent_id, current_price,
+                    order_price, price_distance_pct, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def insert_executions(self, executions: Iterable[dict]) -> int:
+        """Persist execution fills, de-duplicated by IB execution id."""
+        rows = []
+        for execution in executions:
+            exec_id = _text_or_none(execution.get("exec_id"))
+            if not exec_id:
+                continue
+            rows.append(
+                (
+                    exec_id,
+                    _text_or_none(execution.get("time")),
+                    _text_or_none(execution.get("account")),
+                    _text_or_none(execution.get("symbol")),
+                    _text_or_none(execution.get("local_symbol")),
+                    _text_or_none(execution.get("security_type")),
+                    _text_or_none(execution.get("side")),
+                    _float_or_none(execution.get("shares")),
+                    _float_or_none(execution.get("price")),
+                    _float_or_none(execution.get("avg_price")),
+                    _int_or_none(execution.get("order_id")),
+                    _int_or_none(execution.get("perm_id")),
+                    _int_or_none(execution.get("client_id")),
+                    _int_or_none(execution.get("con_id")),
+                    _text_or_none(execution.get("exchange")),
+                    _text_or_none(execution.get("currency")),
+                    _json_dumps(execution),
+                )
+            )
+
+        if not rows:
+            return 0
+
+        with self._connection() as conn:
+            cursor = conn.executemany(
+                """
+                INSERT OR IGNORE INTO executions (
+                    exec_id, time, account, symbol, local_symbol, security_type,
+                    side, shares, price, avg_price, order_id, perm_id, client_id,
+                    con_id, exchange, currency, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def get_recent_executions(self, days: int = 7, limit: int = 5000) -> list[dict]:
+        """Return recently stored executions for order reconciliation."""
+        days = max(1, min(int(days), 30))
+        limit = max(1, min(int(limit), 20000))
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT exec_id, time, account, symbol, local_symbol, security_type,
+                       side, shares, price, avg_price, order_id, perm_id,
+                       client_id, con_id, exchange, currency
+                FROM executions
+                WHERE created_at >= datetime('now', ?)
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (f"-{days} days", limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_earnings_result(
+        self,
+        symbol: str,
+        earnings_date: Optional[str],
+        fetched_at: float,
+        source: str = "yfinance",
+    ) -> None:
+        """Persist one earnings-calendar lookup without deleting old dates."""
+        symbol = (_text_or_none(symbol) or "").upper()
+        source = _text_or_none(source) or "yfinance"
+        fetched_at_value = _float_or_none(fetched_at)
+        if not symbol or fetched_at_value is None:
+            return
+
+        earnings_date = _text_or_none(earnings_date)
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO earnings_fetch_state (
+                    symbol, source, earnings_date, fetched_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(symbol, source) DO UPDATE SET
+                    earnings_date = excluded.earnings_date,
+                    fetched_at = excluded.fetched_at,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (symbol, source, earnings_date, fetched_at_value),
+            )
+            if earnings_date:
+                conn.execute(
+                    """
+                    INSERT INTO earnings_dates (
+                        symbol, earnings_date, source, first_seen_at,
+                        last_seen_at, fetched_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(symbol, earnings_date, source) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at,
+                        fetched_at = excluded.fetched_at,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        symbol,
+                        earnings_date,
+                        source,
+                        fetched_at_value,
+                        fetched_at_value,
+                        fetched_at_value,
+                    ),
+                )
+            conn.commit()
+
+    def get_earnings_cache_entries(self, source: str = "yfinance") -> list[dict]:
+        """Return latest per-symbol earnings cache state for warm startup."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, earnings_date, fetched_at, source
+                FROM earnings_fetch_state
+                WHERE source = ?
+                """,
+                (_text_or_none(source) or "yfinance",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _order_snapshot_key(order: dict) -> str:
+        perm_id = _int_or_none(order.get("perm_id"))
+        order_id = _int_or_none(order.get("order_id"))
+        if perm_id or order_id:
+            return f"PERM:{perm_id or 0}|ORDER:{order_id or 0}"
+
+        parts = [
+            _text_or_none(order.get("account")) or "",
+            _text_or_none(order.get("symbol")) or "",
+            _text_or_none(order.get("local_symbol")) or "",
+            _text_or_none(order.get("security_type")) or "",
+            _text_or_none(order.get("action")) or "",
+            str(_float_or_none(order.get("total_quantity")) or ""),
+            str(_float_or_none(order.get("order_price")) or ""),
+        ]
+        return "ORDER:" + "|".join(parts)
 
     def _snapshot_id(self, conn, account_filter: str, as_of: float) -> Optional[int]:
         row = conn.execute(
@@ -541,6 +959,12 @@ class TimeSeriesStore:
             start_value = _float_or_none(before.get("value")) or 0.0
             end_value = _float_or_none(after.get("value")) or 0.0
             raw_value_delta = end_value - start_value
+            stock_delta_value = self._component_delta(before, after, "stock_value")
+            option_actual_delta_value = self._component_delta(
+                before,
+                after,
+                "option_actual_value",
+            )
             start_quantity = _float_or_none(before.get("quantity"))
             end_quantity = _float_or_none(after.get("quantity"))
             start_price = _float_or_none(before.get("market_price"))
@@ -562,6 +986,8 @@ class TimeSeriesStore:
                     "delta_value": contribution,
                     "abs_delta_value": abs(contribution),
                     "raw_value_delta": raw_value_delta,
+                    "stock_delta_value": stock_delta_value,
+                    "option_actual_delta_value": option_actual_delta_value,
                     "flow_adjustment": flow_adjustment,
                     "contribution_source": contribution_source,
                     "start_quantity": start_quantity,
@@ -591,19 +1017,29 @@ class TimeSeriesStore:
         displayed_position_delta_sum = sum(row["delta_value"] for row in rows)
         reconciliation_delta = net_liquidation_delta - displayed_position_delta_sum
         if abs(reconciliation_delta) >= 0.005:
-            label = "Cash / fees / unexplained"
+            note = (
+                "Cash movement, fees, timing differences, and other account "
+                "changes not explained by displayed positions."
+            )
             if omitted_position_count:
-                label = "Cash / omitted / unexplained"
+                note = (
+                    "Cash movement, fees, timing differences, omitted rows, "
+                    "and other account changes not explained by displayed "
+                    "positions."
+                )
             rows.append({
                 "position_key": "ACCOUNT:RECONCILIATION",
                 "symbol": "ACCOUNT",
-                "label": label,
+                "label": "Other",
+                "note": note,
                 "security_type": "ACCOUNT",
                 "start_value": None,
                 "end_value": None,
                 "delta_value": reconciliation_delta,
                 "abs_delta_value": abs(reconciliation_delta),
                 "raw_value_delta": reconciliation_delta,
+                "stock_delta_value": None,
+                "option_actual_delta_value": None,
                 "flow_adjustment": 0.0,
                 "contribution_source": "reconciliation",
                 "start_quantity": None,
@@ -627,6 +1063,14 @@ class TimeSeriesStore:
             "omitted_position_count": omitted_position_count,
             "rows": rows,
         }
+
+    @staticmethod
+    def _component_delta(before: dict, after: dict, key: str) -> Optional[float]:
+        start = _float_or_none(before.get(key))
+        end = _float_or_none(after.get(key))
+        if start is None and end is None:
+            return None
+        return (end or 0.0) - (start or 0.0)
 
     @staticmethod
     def _value_contribution(
@@ -680,8 +1124,9 @@ class TimeSeriesStore:
         rows = conn.execute(
             f"""
             SELECT position_key, symbol, security_type, quantity, market_price,
-                   stock_value, option_actual_value, option_notional_value, npv,
-                   raw_json, {value_column} AS value
+                   price_source, stock_value, option_actual_value,
+                   option_notional_shares, option_notional_value, npv,
+                   raw_json, as_of, account_filter, {value_column} AS value
             FROM position_snapshots
             WHERE account_snapshot_id = ?
             """,
@@ -690,26 +1135,136 @@ class TimeSeriesStore:
         result = {}
         for row in rows:
             raw = _json_loads_dict(row["raw_json"])
+            quantity = _float_or_none(row["quantity"]) or 0.0
+            market_price = _float_or_none(row["market_price"])
+            stock_value = _float_or_none(row["stock_value"]) or 0.0
+            option_notional_value = _float_or_none(row["option_notional_value"]) or 0.0
+            value = _float_or_none(row["value"])
+            if (
+                value_column in {
+                    "market_value",
+                    "stock_value",
+                    "option_notional_value",
+                    "npv",
+                }
+                and quantity != 0
+                and (row["price_source"] or "").lower() == "option_greeks"
+            ):
+                reliable_price = self._nearest_reliable_symbol_price(conn, row)
+                if reliable_price is not None:
+                    market_price = reliable_price
+                    stock_value = quantity * reliable_price
+                    option_notional_value = (
+                        (_float_or_none(row["option_notional_shares"]) or 0.0)
+                        * reliable_price
+                    )
+                    option_actual_value = _float_or_none(row["option_actual_value"]) or 0.0
+                    if value_column == "market_value":
+                        value = stock_value + option_actual_value
+                    elif value_column == "stock_value":
+                        value = stock_value
+                    elif value_column == "option_notional_value":
+                        value = option_notional_value
+                    elif value_column == "npv":
+                        value = stock_value + option_notional_value
             result[row["position_key"]] = {
                 "symbol": row["symbol"],
                 "label": row["symbol"],
                 "security_type": row["security_type"],
                 "quantity": row["quantity"],
-                "market_price": row["market_price"],
-                "value": row["value"],
+                "market_price": market_price,
+                "value": value,
                 "cost_basis": _float_or_none(raw.get("underlying_cost_basis")),
-                "stock_value": row["stock_value"],
+                "stock_value": stock_value,
                 "option_actual_value": row["option_actual_value"],
-                "option_notional_value": row["option_notional_value"],
+                "option_notional_value": option_notional_value,
                 "npv": row["npv"],
             }
+        if value_column in {"market_value", "option_actual_value"}:
+            overrides = self._contract_symbol_value_overrides(conn, snapshot_id)
+            for key, override in overrides.items():
+                if key not in result:
+                    continue
+                result[key]["value"] = (
+                    override["market_value"]
+                    if value_column == "market_value"
+                    else override["option_actual_value"]
+                )
+                result[key]["stock_value"] = override["stock_value"]
+                result[key]["option_actual_value"] = override["option_actual_value"]
         return result
 
-    def _contract_positions(self, conn, snapshot_id: int) -> dict:
+    def _nearest_reliable_symbol_price(self, conn, row) -> Optional[float]:
+        """Find a same-day stock mark to replace bad historical option undPrice."""
+        placeholders = ",".join("?" for _ in RELIABLE_UNDERLYING_PRICE_SOURCES)
+        reliable_row = conn.execute(
+            f"""
+            SELECT market_price
+            FROM position_snapshots
+            WHERE account_filter = ?
+              AND symbol = ?
+              AND market_price IS NOT NULL
+              AND market_price > 0
+              AND price_source IN ({placeholders})
+              AND date(as_of, 'unixepoch', 'localtime') =
+                  date(?, 'unixepoch', 'localtime')
+            ORDER BY abs(as_of - ?) ASC, as_of ASC
+            LIMIT 1
+            """,
+            (
+                row["account_filter"],
+                row["symbol"],
+                *sorted(RELIABLE_UNDERLYING_PRICE_SOURCES),
+                row["as_of"],
+                row["as_of"],
+            ),
+        ).fetchone()
+        if reliable_row is None:
+            return None
+        return _float_or_none(reliable_row["market_price"])
+
+    def _contract_symbol_value_overrides(self, conn, snapshot_id: int) -> dict:
+        underlying_prices = self._snapshot_reliable_underlying_prices(conn, snapshot_id)
         rows = conn.execute(
             """
-            SELECT position_key, symbol, local_symbol, security_type, quantity,
-                   market_price, average_cost, market_value AS value
+            SELECT symbol, security_type, expiry, strike, right, quantity,
+                   market_price, market_value AS value, average_cost,
+                   multiplier, price_source, as_of
+            FROM contract_snapshots
+            WHERE account_snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        by_symbol = {}
+        for row in rows:
+            symbol = row["symbol"]
+            if not symbol:
+                continue
+            entry = by_symbol.setdefault(
+                f"SYMBOL:{symbol}",
+                {"stock_value": 0.0, "option_actual_value": 0.0, "market_value": 0.0},
+            )
+            value = _sanitized_contract_market_value(
+                row,
+                underlying_price=underlying_prices.get(symbol),
+                as_of=row["as_of"],
+            ) or 0.0
+            if (row["security_type"] or "").upper() == "OPT":
+                entry["option_actual_value"] += value
+            else:
+                entry["stock_value"] += value
+
+        for entry in by_symbol.values():
+            entry["market_value"] = entry["stock_value"] + entry["option_actual_value"]
+        return by_symbol
+
+    def _contract_positions(self, conn, snapshot_id: int) -> dict:
+        underlying_prices = self._snapshot_reliable_underlying_prices(conn, snapshot_id)
+        rows = conn.execute(
+            """
+            SELECT position_key, symbol, local_symbol, security_type, expiry,
+                   strike, right, quantity, market_price, average_cost,
+                   multiplier, price_source, as_of, market_value AS value
             FROM contract_snapshots
             WHERE account_snapshot_id = ?
             """,
@@ -723,7 +1278,30 @@ class TimeSeriesStore:
                 "quantity": row["quantity"],
                 "market_price": row["market_price"],
                 "cost_basis": row["average_cost"],
-                "value": row["value"],
+                "value": _sanitized_contract_market_value(
+                    row,
+                    underlying_price=underlying_prices.get(row["symbol"]),
+                    as_of=row["as_of"],
+                ),
             }
             for row in rows
+        }
+
+    def _snapshot_reliable_underlying_prices(self, conn, snapshot_id: int) -> dict:
+        placeholders = ",".join("?" for _ in RELIABLE_UNDERLYING_PRICE_SOURCES)
+        rows = conn.execute(
+            f"""
+            SELECT symbol, market_price
+            FROM position_snapshots
+            WHERE account_snapshot_id = ?
+              AND market_price IS NOT NULL
+              AND market_price > 0
+              AND price_source IN ({placeholders})
+            """,
+            (snapshot_id, *sorted(RELIABLE_UNDERLYING_PRICE_SOURCES)),
+        ).fetchall()
+        return {
+            row["symbol"]: _float_or_none(row["market_price"])
+            for row in rows
+            if row["symbol"]
         }

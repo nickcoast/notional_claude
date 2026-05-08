@@ -1,0 +1,47 @@
+<div id="info-modal" class="hidden fixed inset-0 z-50">
+    <button id="info-modal-backdrop"
+            class="absolute inset-0 bg-black/70 cursor-default"
+            aria-label="Close details"></button>
+    <section class="absolute left-1/2 top-1/2 w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 -translate-y-1/2 rounded border border-gray-800 bg-gray-950 shadow-2xl">
+        <header class="flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-800">
+            <div id="info-modal-title" class="text-sm font-bold text-gray-100">Details</div>
+            <button id="info-modal-close"
+                    class="text-gray-500 hover:text-gray-100 text-lg leading-none px-2"
+                    aria-label="Close details">×</button>
+        </header>
+        <div id="info-modal-body" class="px-4 py-4 text-sm leading-relaxed text-gray-300"></div>
+    </section>
+</div>
+
+<script>
+(function () {
+    var modal = document.getElementById('info-modal');
+    var title = document.getElementById('info-modal-title');
+    var body = document.getElementById('info-modal-body');
+    if (!modal || !title || !body) return;
+
+    function setOpen(open) {
+        modal.classList.toggle('hidden', !open);
+    }
+
+    function openInfo(nextTitle, nextBody) {
+        title.textContent = nextTitle || 'Details';
+        body.textContent = nextBody || '';
+        setOpen(true);
+    }
+
+    document.body.addEventListener('click', function (event) {
+        if (event.target.closest('[data-news-symbol]')) return;
+        var target = event.target.closest('[data-info-title][data-info-body]');
+        if (!target) return;
+        event.preventDefault();
+        openInfo(target.dataset.infoTitle, target.dataset.infoBody);
+    });
+
+    document.getElementById('info-modal-close').addEventListener('click', function () { setOpen(false); });
+    document.getElementById('info-modal-backdrop').addEventListener('click', function () { setOpen(false); });
+    document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape') setOpen(false);
+    });
+}());
+</script>

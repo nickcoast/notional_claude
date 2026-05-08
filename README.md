@@ -13,6 +13,19 @@ Then open http://127.0.0.1:8000 in a browser. TWS must already be running and ac
 
 The equivalent manual command: `uvicorn api:app --host 127.0.0.1 --port 8000`
 
+To view the dashboard from another device on the same trusted network, start it
+on all network interfaces:
+
+```sh
+./run.sh --lan
+```
+
+The script prints a same-network URL such as `http://192.168.1.23:8000` for
+your phone. macOS may ask whether to allow incoming connections for Python; allow
+that for the same-network URL to work. Keep this LAN mode on trusted networks
+only: the app does not have separate login/auth beyond access to the running Mac
+and TWS session.
+
 ## Configuration
 
 Edit `config.json` to set account nicknames (created automatically on first run):
@@ -62,9 +75,25 @@ that needs to display orders placed outside this app.
 Open-order rows include a calculated `Away` percentage: the absolute distance
 between the actionable order price and current market reference price. Stock
 orders use last trade when available; option orders prefer the bid/ask midpoint.
+The orders page reconciles open-order status with same-session executions so a
+stale open-order status does not keep a filled order looking actionable. Filled
+orders are hidden by default and can be shown with the `Show filled` toggle.
+Each poll stores the displayed order rows in SQLite and de-duplicates execution
+fills by IB execution id. On startup, the service asks TWS for recent executions
+using a read-only `reqExecutions` request so completed fills can survive app
+restarts. The default backfill window is 7 days, but IBKR only returns what TWS
+has available in its Trade Log settings; IB Gateway is typically limited to the
+current day. Older stored executions remain available for future history views,
+but the live Orders page only synthesizes filled rows for today's executions so
+`Show filled` does not turn into a multi-day trade log.
 
 Portfolio and order symbols use the same earnings-date highlighting: red within
-3 days, orange within 7 days, and amber within 30 days.
+3 days, orange within 7 days, and amber within 30 days. Tapping a highlighted
+symbol opens an in-app details modal instead of relying on browser tooltips or
+classic JavaScript dialogs. Earnings lookups are cached in SQLite as well as in
+memory, so restarting the app can reuse recent lookup results. Previously seen
+earnings dates are retained after they pass, because past earnings dates may be
+useful for later chart annotations and post-mortems.
 
 Portfolio and order symbols also include an `N` news button. Clicking it opens a
 symbol news drawer that lazily fetches recent IBKR API headlines, shows the
@@ -84,21 +113,26 @@ exposes a provider/article id for each article, but not a separate canonical
 The history page persists one SQLite row per successful poll. Restarting the app
 reloads the existing `history.sqlite3` data and appends new snapshots. Account
 snapshots store Net Liquidation and other account-level metrics for charting.
-Symbol-level position snapshots store actual market value (`stock_value +
-option_actual_value`), stock value, option actual value, option notional value,
-and NPV. The default History comparison uses actual value, because option
-notional is an exposure metric and does not directly explain NLV changes.
+History defaults to the current calendar day and has its own account selector,
+using account nicknames from `config.json`. The SQLite schema stores
+`account_filter` on account, symbol, contract, and daily-extreme rows, so it can
+hold history for multiple accounts; the polling service writes the account
+filter active for that poll. Symbol-level position snapshots store actual market
+value (`stock_value + option_actual_value`), stock value, option actual value,
+option notional value, and NPV. The default History comparison uses actual
+value, because option notional is an exposure metric and does not directly
+explain NLV changes.
 
 History comparisons estimate each position's contribution to the selected NLV
 move. When quantity changes and a cost basis is available, the comparison
 subtracts estimated trade flow from raw market-value change so adding or
 reducing shares does not dominate the list purely because capital moved into or
-out of the position. A reconciliation row accounts for cash movement, fees,
-omitted rows, timing differences, and other non-position deltas so displayed
-contributions add back to the selected NLV change. Contract-level portfolio
-marks are also stored so later views can drill into individual stock or option
-contracts. Daily high/low Net Liquidation values are rolled up as snapshots
-arrive.
+out of the position. An `Other` reconciliation row accounts for cash movement,
+fees, omitted rows, timing differences, and other non-position deltas so
+displayed contributions add back to the selected NLV change. Contract-level
+portfolio marks are also stored so later views can drill into individual stock
+or option contracts. Daily high/low Net Liquidation values are rolled up as
+snapshots arrive.
 
 ## Future work
 
@@ -115,6 +149,12 @@ arrive.
   icon with checkboxes. Hidden columns should still be fetched and kept current
   so they reappear immediately and remain available for analytics such as
   time-series storage.
+- Keep live and historical data paths split deliberately. The polling service
+  should continue to write fresh IB results to SQLite and update an in-memory
+  snapshot for the live Portfolio and Orders pages. Historical views, future
+  order-history views, and analytics should read from SQLite. This keeps live
+  SSE refreshes fast while making the database the durable source for charts,
+  completed fills, earnings annotations, and post-mortems.
 
 ## What is calculated vs. from IB
 
@@ -155,6 +195,10 @@ database contents are not committed.
 | `IB_HISTORY_DB` | `history.sqlite3` | SQLite path for stored time-series history |
 | `IB_READONLY` | `1` | Tell `ib_insync` to avoid its startup order-sync requests; this is separate from TWS API Read-Only mode |
 | `IB_OPEN_ORDER_SCOPE` | `all` | Open-order query scope: `local`, `all`, or `client`; `all` uses `reqAllOpenOrders`, while `client` uses `reqOpenOrders` and may be rejected by TWS API Read-Only mode |
+| `IB_EXECUTION_BACKFILL_DAYS` | `7` | Days of executions to request from TWS at startup, capped at 7 and limited by TWS/Gateway availability |
+| `IB_LOG_FILE` | `ib_service.log` | Service log file path |
+| `IB_LOG_MAX_BYTES` | `5242880` | Bytes per service log file before rotation |
+| `IB_LOG_BACKUP_COUNT` | `5` | Number of rotated service log files to keep |
 | `IB_NEWS_PROVIDERS` | auto | `+`-separated IBKR API news provider codes; defaults to subscribed providers returned by TWS |
 | `IB_NEWS_CACHE_TTL` | `300` | Seconds to cache headline and article-body responses |
 | `IB_NEWS_KEYWORDS` | empty | Comma-separated keywords to tag in news headlines and article bodies |

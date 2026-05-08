@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request
@@ -25,15 +26,28 @@ from fastapi.templating import Jinja2Templates
 
 from service import DEFAULT_POLL_INTERVAL, IBPollingService
 
+LOG_FILE = os.getenv("IB_LOG_FILE", "ib_service.log")
+LOG_MAX_BYTES = int(os.getenv("IB_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv("IB_LOG_BACKUP_COUNT", "5"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("ib_service.log"),
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+        ),
         logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("ib_api")
+
+# ib_insync logs full position, order, execution, and commission payloads at
+# INFO on every connection. Keep warnings/errors, but avoid filling the service
+# log with sensitive, high-volume account details.
+logging.getLogger("ib_insync").setLevel(logging.WARNING)
 
 # ib_insync emits "Can't find EId with tickerId:N" at WARNING level when
 # cancelMktData is called for a request IB never acknowledged (common after

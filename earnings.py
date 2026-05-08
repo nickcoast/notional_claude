@@ -78,11 +78,38 @@ class EarningsCache:
     immediately.  snapshot() always returns whatever is currently cached.
     """
 
-    def __init__(self):
+    def __init__(self, store=None, source: str = "yfinance"):
         self._lock = threading.Lock()
         self._dates: dict[str, Optional[date]] = {}       # symbol → next date or None
         self._fetched_at: dict[str, float] = {}            # symbol → unix timestamp
         self._refreshing = False
+        self._store = store
+        self._source = source
+        self._load_from_store()
+
+    def _load_from_store(self) -> None:
+        if self._store is None:
+            return
+        try:
+            entries = self._store.get_earnings_cache_entries(self._source)
+        except Exception as exc:
+            logger.warning("Failed to load earnings cache from SQLite: %s", exc)
+            return
+
+        with self._lock:
+            for entry in entries:
+                symbol = str(entry.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                earnings_date = entry.get("earnings_date")
+                parsed_date = None
+                if earnings_date:
+                    try:
+                        parsed_date = date.fromisoformat(str(earnings_date))
+                    except ValueError:
+                        parsed_date = None
+                self._dates[symbol] = parsed_date
+                self._fetched_at[symbol] = float(entry.get("fetched_at") or 0.0)
 
     def _ttl_for(self, sym: str) -> float:
         """Return the TTL (seconds) appropriate for a symbol's current cached state."""
@@ -126,8 +153,23 @@ class EarningsCache:
             for sym in symbols:
                 self._fetched_at[sym] = now
             self._refreshing = False
+        self._persist_results(new_dates, now)
         found = sum(1 for d in new_dates.values() if d is not None)
         logger.info("Earnings calendar refreshed (%d/%d have dates)", found, len(symbols))
+
+    def _persist_results(self, results: dict[str, Optional[date]], fetched_at: float) -> None:
+        if self._store is None:
+            return
+        for symbol, earnings_date in results.items():
+            try:
+                self._store.upsert_earnings_result(
+                    symbol=symbol,
+                    earnings_date=earnings_date.isoformat() if earnings_date else None,
+                    fetched_at=fetched_at,
+                    source=self._source,
+                )
+            except Exception as exc:
+                logger.warning("Failed to store earnings date for %s: %s", symbol, exc)
 
     def snapshot(self) -> dict[str, Optional[str]]:
         """Return {symbol: 'YYYY-MM-DD' or None} — JSON-serializable."""

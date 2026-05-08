@@ -3,7 +3,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +73,10 @@ class TimeSeriesStoreTest(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute("SELECT COUNT(*) FROM account_snapshots").fetchone()[0]
 
+    def table_count(self, table):
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
     def test_live_fixture_inserts_history_and_daily_extremes(self):
         fixture, _ids = self.insert_fixture()
 
@@ -109,6 +115,82 @@ class TimeSeriesStoreTest(unittest.TestCase):
 
         self.assertEqual(duplicate_id, first_id)
         self.assertEqual(self.account_snapshot_count(), 1)
+
+    def test_order_snapshots_and_executions_are_persisted(self):
+        orders = [
+            {
+                "account": "TEST_ACCOUNT",
+                "symbol": "AAPL",
+                "local_symbol": "AAPL",
+                "security_type": "STK",
+                "action": "BUY",
+                "order_type": "LMT",
+                "total_quantity": 10,
+                "limit_price": 190.0,
+                "status": "Submitted",
+                "filled": 0,
+                "remaining": 10,
+                "order_id": 11,
+                "perm_id": 22,
+                "order_price": 190.0,
+                "current_price": 191.0,
+                "price_distance_pct": 0.52,
+            }
+        ]
+        executions = [
+            {
+                "exec_id": "0001.01",
+                "time": "20260508 12:00:00",
+                "account": "TEST_ACCOUNT",
+                "symbol": "AAPL",
+                "local_symbol": "AAPL",
+                "security_type": "STK",
+                "side": "BOT",
+                "shares": 10,
+                "price": 190.0,
+                "avg_price": 190.0,
+                "order_id": 11,
+                "perm_id": 22,
+                "client_id": 1234,
+                "con_id": 265598,
+                "exchange": "NASDAQ",
+                "currency": "USD",
+            }
+        ]
+
+        self.assertEqual(
+            self.store.insert_order_snapshot(1000.0, "TEST_ACCOUNT", orders),
+            1,
+        )
+        self.assertEqual(self.store.insert_executions(executions), 1)
+        self.assertEqual(self.store.insert_executions(executions), 0)
+
+        self.assertEqual(self.table_count("order_snapshots"), 1)
+        self.assertEqual(self.table_count("executions"), 1)
+        self.assertEqual(self.store.get_recent_executions()[0]["exec_id"], "0001.01")
+
+    def test_earnings_results_preserve_historical_dates(self):
+        self.store.upsert_earnings_result("AAPL", "2026-05-01", 1000.0)
+        self.store.upsert_earnings_result("AAPL", "2026-08-01", 2000.0)
+        self.store.upsert_earnings_result("ETF", None, 3000.0)
+
+        cache_entries = {
+            row["symbol"]: row
+            for row in self.store.get_earnings_cache_entries()
+        }
+        self.assertEqual(cache_entries["AAPL"]["earnings_date"], "2026-08-01")
+        self.assertEqual(cache_entries["ETF"]["earnings_date"], None)
+
+        with sqlite3.connect(self.db_path) as conn:
+            dates = conn.execute(
+                """
+                SELECT earnings_date
+                FROM earnings_dates
+                WHERE symbol = 'AAPL'
+                ORDER BY earnings_date
+                """
+            ).fetchall()
+        self.assertEqual([row[0] for row in dates], ["2026-05-01", "2026-08-01"])
 
     def test_live_fixture_compares_symbols_by_largest_value_change(self):
         fixture, ids = self.insert_fixture()
@@ -284,6 +366,360 @@ class TimeSeriesStoreTest(unittest.TestCase):
         self.assertEqual(comparison["rows"][0]["label"], "SYM100 OPT")
         self.assertAlmostEqual(comparison["rows"][0]["delta_value"], 140.0)
         self.assertAlmostEqual(comparison["rows"][1]["quantity_delta"], -1.0)
+
+    def test_symbol_comparison_ignores_option_avg_cost_fallback_marks(self):
+        first = {
+            "as_of": 1700000300.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "DUOL",
+                    "stock_count": 4.0,
+                    "underlying_market_price": 106.0,
+                    "underlying_cost_basis": 102.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 424.0,
+                    "option_actual_value": 15.0,
+                    "option_notional_value": 0.0,
+                    "npv": 424.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": 1700000315.0,
+            "metrics": {"net_liquidation": 1001.0},
+            "positions": [
+                {
+                    "symbol": "DUOL",
+                    "stock_count": 4.0,
+                    "underlying_market_price": 106.25,
+                    "underlying_cost_basis": 102.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 425.0,
+                    "option_actual_value": 459.44,
+                    "option_notional_value": 0.0,
+                    "npv": 425.0,
+                }
+            ],
+        }
+        first_contracts = [
+            {
+                "account": "TEST_ACCOUNT",
+                "symbol": "DUOL",
+                "security_type": "STK",
+                "con_id": 2001,
+                "quantity": 4,
+                "market_price": 106.0,
+                "market_value": 424.0,
+                "average_cost": 102.0,
+            },
+            {
+                "account": "TEST_ACCOUNT",
+                "symbol": "DUOL",
+                "local_symbol": "DUOL OPT",
+                "security_type": "OPT",
+                "con_id": 1001,
+                "quantity": 3,
+                "market_price": 0.05,
+                "market_value": 15.0,
+                "average_cost": 153.14796665,
+                "multiplier": 100,
+            },
+        ]
+        second_contracts = [
+            {
+                "account": "TEST_ACCOUNT",
+                "symbol": "DUOL",
+                "security_type": "STK",
+                "con_id": 2001,
+                "quantity": 4,
+                "market_price": 106.25,
+                "market_value": 425.0,
+                "average_cost": 102.0,
+            },
+            {
+                "account": "TEST_ACCOUNT",
+                "symbol": "DUOL",
+                "local_symbol": "DUOL OPT",
+                "security_type": "OPT",
+                "con_id": 1001,
+                "quantity": 3,
+                "market_price": 1.5314796665,
+                "market_value": 459.44389995,
+                "average_cost": 153.14796665,
+                "multiplier": 100,
+            },
+        ]
+
+        first_id = self.store.insert_snapshot(
+            first,
+            "TEST_ACCOUNT",
+            contract_positions=first_contracts,
+        )
+        second_id = self.store.insert_snapshot(
+            second,
+            "TEST_ACCOUNT",
+            contract_positions=second_contracts,
+        )
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "DUOL")
+        self.assertAlmostEqual(row["start_value"], 439.0)
+        self.assertAlmostEqual(row["end_value"], 425.0)
+        self.assertAlmostEqual(row["delta_value"], -14.0)
+
+    def test_symbol_comparison_ignores_stock_cost_basis_fallback_marks(self):
+        first = {
+            "as_of": 1700000400.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "ACB",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 100.0,
+                    "underlying_cost_basis": 100.0,
+                    "underlying_price_source": "cost_basis",
+                    "stock_value": 1000.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 1000.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": 1700000415.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "ACB",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 110.0,
+                    "underlying_cost_basis": 110.0,
+                    "underlying_price_source": "cost_basis",
+                    "stock_value": 1100.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 1100.0,
+                }
+            ],
+        }
+        first_id = self.store.insert_snapshot(
+            first,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "ACB",
+                    "security_type": "STK",
+                    "con_id": 3001,
+                    "quantity": 10,
+                    "market_price": 100.0,
+                    "market_value": 1000.0,
+                    "average_cost": 100.0,
+                    "price_source": "cost_basis",
+                }
+            ],
+        )
+        second_id = self.store.insert_snapshot(
+            second,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "ACB",
+                    "security_type": "STK",
+                    "con_id": 3001,
+                    "quantity": 10,
+                    "market_price": 110.0,
+                    "market_value": 1100.0,
+                    "average_cost": 110.0,
+                    "price_source": "cost_basis",
+                }
+            ],
+        )
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "ACB")
+        self.assertAlmostEqual(row["start_value"], 0.0)
+        self.assertAlmostEqual(row["end_value"], 0.0)
+        self.assertAlmostEqual(row["delta_value"], 0.0)
+
+    def test_symbol_comparison_replaces_option_greeks_stock_marks(self):
+        bad_start = {
+            "as_of": 1700000500.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "GOOGX",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 356.0,
+                    "underlying_cost_basis": 329.0,
+                    "underlying_price_source": "option_greeks",
+                    "stock_value": 3560.0,
+                    "option_actual_value": 5.0,
+                    "option_notional_shares": 1.0,
+                    "option_notional_value": 356.0,
+                    "npv": 3916.0,
+                }
+            ],
+        }
+        reliable_midday = {
+            "as_of": 1700000600.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "GOOGX",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 385.0,
+                    "underlying_cost_basis": 329.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 3850.0,
+                    "option_actual_value": 5.0,
+                    "option_notional_shares": 1.0,
+                    "option_notional_value": 385.0,
+                    "npv": 4235.0,
+                }
+            ],
+        }
+        reliable_end = {
+            "as_of": 1700000700.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "GOOGX",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 386.0,
+                    "underlying_cost_basis": 329.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 3860.0,
+                    "option_actual_value": 5.0,
+                    "option_notional_shares": 1.0,
+                    "option_notional_value": 386.0,
+                    "npv": 4246.0,
+                }
+            ],
+        }
+
+        start_id = self.store.insert_snapshot(bad_start, "TEST_ACCOUNT")
+        self.store.insert_snapshot(reliable_midday, "TEST_ACCOUNT")
+        end_id = self.store.insert_snapshot(reliable_end, "TEST_ACCOUNT")
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=start_id,
+            end_id=end_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "GOOGX")
+        self.assertAlmostEqual(row["start_price"], 385.0)
+        self.assertAlmostEqual(row["start_value"], 3855.0)
+        self.assertAlmostEqual(row["end_value"], 3865.0)
+        self.assertAlmostEqual(row["price_delta"], 1.0)
+        self.assertAlmostEqual(row["delta_value"], 10.0)
+
+    def test_symbol_comparison_floors_expiring_option_at_intrinsic_value(self):
+        start_ts = datetime(
+            2026,
+            5,
+            6,
+            13,
+            0,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        peak_ts = datetime(
+            2026,
+            5,
+            6,
+            13,
+            25,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        start = {
+            "as_of": start_ts,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "NVDA",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 207.40,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        peak = {
+            "as_of": peak_ts,
+            "metrics": {"net_liquidation": 2080.0},
+            "positions": [
+                {
+                    "symbol": "NVDA",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 208.70,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        option_contract = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "NVDA",
+            "local_symbol": "NVDA 260506C00207500",
+            "security_type": "OPT",
+            "con_id": 9001,
+            "expiry": "20260506",
+            "strike": 207.5,
+            "right": "C",
+            "quantity": 9,
+            "market_price": 0.0,
+            "market_value": 0.0,
+            "multiplier": 100,
+            "price_source": "unavailable",
+        }
+
+        start_id = self.store.insert_snapshot(
+            start,
+            "TEST_ACCOUNT",
+            contract_positions=[option_contract],
+        )
+        peak_id = self.store.insert_snapshot(
+            peak,
+            "TEST_ACCOUNT",
+            contract_positions=[option_contract],
+        )
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=start_id,
+            end_id=peak_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "NVDA")
+        self.assertAlmostEqual(row["start_value"], 0.0)
+        self.assertAlmostEqual(row["end_value"], 1080.0)
+        self.assertAlmostEqual(row["delta_value"], 1080.0)
+        self.assertAlmostEqual(row["option_actual_delta_value"], 1080.0)
 
 
 if __name__ == "__main__":

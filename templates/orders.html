@@ -18,14 +18,22 @@
             <h1 class="text-base font-bold tracking-widest text-gray-300 uppercase">
                 IB Open Orders
             </h1>
-            <nav class="flex items-center gap-1 text-xs">
-                <a href="/"
-                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
-                <a href="/orders"
-                   class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">Orders</a>
-                <a href="/history"
-                   class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">History</a>
-            </nav>
+            <div class="flex items-center gap-3">
+                <label class="flex items-center gap-1 text-xs text-gray-500 select-none">
+                    <input id="show-filled-orders"
+                           type="checkbox"
+                           class="h-3 w-3 accent-gray-600">
+                    Show filled
+                </label>
+                <nav class="flex items-center gap-1 text-xs">
+                    <a href="/"
+                       class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">Portfolio</a>
+                    <a href="/orders"
+                       class="px-2 py-1 rounded bg-gray-800 text-gray-100 border border-gray-700">Orders</a>
+                    <a href="/history"
+                       class="px-2 py-1 rounded text-gray-500 hover:text-gray-200 hover:bg-gray-900">History</a>
+                </nav>
+            </div>
         </div>
 
         <div hx-ext="sse" sse-connect="/stream-orders-html" sse-swap="message">
@@ -37,6 +45,7 @@
     </div>
 
     {% include "_news_modal.html" %}
+    {% include "_info_modal.html" %}
 
     <script>
     (function () {
@@ -75,6 +84,19 @@
             updateMarkers(table);
         }
 
+        function applyFilledVisibility() {
+            const showFilled = document.getElementById('show-filled-orders').checked;
+            let visible = 0;
+            document.querySelectorAll('tr[data-order-filled]').forEach(function (row) {
+                const hidden = row.dataset.orderFilled === 'true' && !showFilled;
+                row.classList.toggle('hidden', hidden);
+                if (!hidden) visible += 1;
+            });
+            document.querySelectorAll('[data-filled-filter-empty]').forEach(function (message) {
+                message.classList.toggle('hidden', visible !== 0 || showFilled);
+            });
+        }
+
         function updateMarkers(table) {
             (table || document.querySelector('table[data-sortable]'))
                 .querySelectorAll('thead th .sort-marker')
@@ -85,7 +107,14 @@
                 });
         }
 
-        document.body.addEventListener('htmx:afterSwap', applySort);
+        document.body.addEventListener('htmx:afterSwap', function () {
+            applyFilledVisibility();
+            applySort();
+        });
+        document.getElementById('show-filled-orders').addEventListener('change', function () {
+            applyFilledVisibility();
+            applySort();
+        });
         document.body.addEventListener('click', function (e) {
             var th = e.target.closest('table[data-sortable] thead th');
             if (!th) return;
