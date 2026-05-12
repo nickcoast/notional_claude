@@ -122,6 +122,43 @@ def option_intrinsic_floor_value(contract, underlying_price, quantity, multiplie
     floor_abs = intrinsic * mult * abs(qty)
     return floor_abs if qty > 0 else -floor_abs
 
+
+def option_after_exercise_cutoff(contract, now_ts):
+    """Return True once an option is past its same-day exercise cutoff."""
+    expiry = option_expiry_date(getattr(contract, "lastTradeDateOrContractMonth", ""))
+    if expiry is None:
+        return False
+    now_et = datetime.fromtimestamp(now_ts, OPTION_EXERCISE_TIMEZONE)
+    cutoff_et = datetime.combine(
+        expiry,
+        option_exercise_cutoff_time(),
+        tzinfo=OPTION_EXERCISE_TIMEZONE,
+    )
+    return now_et > cutoff_et
+
+
+def option_intrinsic_value(contract, underlying_price, quantity, multiplier):
+    """Signed intrinsic value for an option, independent of exercise cutoff."""
+    price = safe_float_conversion(underlying_price)
+    strike = safe_float_conversion(getattr(contract, "strike", None))
+    qty = safe_float_conversion(quantity)
+    mult = safe_float_conversion(multiplier) or 100.0
+    if price <= 0 or strike <= 0 or qty == 0 or mult <= 0:
+        return None
+
+    right = str(getattr(contract, "right", "")).upper()
+    if right == "C":
+        intrinsic = max(price - strike, 0.0)
+    elif right == "P":
+        intrinsic = max(strike - price, 0.0)
+    else:
+        return None
+
+    if intrinsic <= 0:
+        return 0.0
+    value = intrinsic * mult * abs(qty)
+    return value if qty > 0 else -value
+
 # Process-lifetime state — survives Streamlit reruns because this module is
 # imported once per process, not re-executed on each rerun like the main script.
 _runtime_cache = {
@@ -815,7 +852,17 @@ def get_portfolio_data_sync(
                         multiplier,
                         now_ts,
                     )
-                    if intrinsic_floor_value is not None:
+                    if option_after_exercise_cutoff(contract, now_ts):
+                        intrinsic_value = option_intrinsic_value(
+                            contract,
+                            underlying_price_for_intrinsic,
+                            pos.position,
+                            multiplier,
+                        )
+                        if intrinsic_value is not None:
+                            option_actual_value = intrinsic_value
+                            option_value_source = "expired_intrinsic"
+                    elif intrinsic_floor_value is not None:
                         if (
                             pos.position > 0
                             and option_actual_value < intrinsic_floor_value

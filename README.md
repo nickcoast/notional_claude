@@ -127,12 +127,16 @@ History comparisons estimate each position's contribution to the selected NLV
 move. When quantity changes and a cost basis is available, the comparison
 subtracts estimated trade flow from raw market-value change so adding or
 reducing shares does not dominate the list purely because capital moved into or
-out of the position. An `Other` reconciliation row accounts for cash movement,
-fees, omitted rows, timing differences, and other non-position deltas so
-displayed contributions add back to the selected NLV change. Contract-level
-portfolio marks are also stored so later views can drill into individual stock
-or option contracts. Daily high/low Net Liquidation values are rolled up as
-snapshots arrive.
+out of the position. When execution fills are stored for the selected interval,
+the comparison uses actual signed execution flow instead of cost-basis
+estimates. Contract-level portfolio marks are also stored so later views can
+drill into individual stock or option contracts, and same-day unavailable option
+marks fall back to the most recent reliable mark for that contract. After the
+same-day exercise cutoff, expiring options are valued at intrinsic value instead
+of stale option-market marks. An `Other` reconciliation row accounts for cash
+movement, fees, omitted rows, timing differences, and other non-position deltas
+so displayed contributions add back to the selected NLV change. Daily high/low
+Net Liquidation values are rolled up as snapshots arrive.
 
 ## Future work
 

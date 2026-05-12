@@ -103,22 +103,25 @@ def _sanitized_contract_market_value(
     as_of: Optional[float] = None,
 ) -> Optional[float]:
     """Return contract market value with bad fallbacks removed and floors applied."""
+    intrinsic_value = _contract_intrinsic_value(row, underlying_price)
+    if _contract_after_exercise_cutoff(row, as_of):
+        return intrinsic_value
+
     price_source = (row["price_source"] or "").lower()
     if price_source == "cost_basis" or _is_option_cost_basis_fallback(row):
         value = 0.0
     else:
         value = _float_or_none(row["value"])
 
-    intrinsic_floor = _contract_intrinsic_floor_value(row, underlying_price, as_of)
-    if intrinsic_floor is None:
+    if intrinsic_value is None:
         return value
     if value is None:
         value = 0.0
     quantity = _float_or_none(row["quantity"]) or 0.0
-    if quantity > 0 and value < intrinsic_floor:
-        return intrinsic_floor
-    if quantity < 0 and value > intrinsic_floor:
-        return intrinsic_floor
+    if quantity > 0 and value < intrinsic_value:
+        return intrinsic_value
+    if quantity < 0 and value > intrinsic_value:
+        return intrinsic_value
     return value
 
 
@@ -140,23 +143,27 @@ def _option_exercise_cutoff_time():
         return datetime_time(17, 20)
 
 
-def _contract_intrinsic_floor_value(row, underlying_price, as_of):
+def _contract_after_exercise_cutoff(row, as_of) -> bool:
     if (row["security_type"] or "").upper() != "OPT":
-        return None
+        return False
     expiry = _option_expiry_date(row["expiry"])
     if expiry is None:
-        return None
+        return False
 
     as_of_ts = _float_or_none(as_of if as_of is not None else row["as_of"])
     if as_of_ts is None:
-        return None
+        return False
     as_of_et = datetime.fromtimestamp(as_of_ts, OPTION_EXERCISE_TIMEZONE)
     cutoff_et = datetime.combine(
         expiry,
         _option_exercise_cutoff_time(),
         tzinfo=OPTION_EXERCISE_TIMEZONE,
     )
-    if as_of_et > cutoff_et:
+    return as_of_et > cutoff_et
+
+
+def _contract_intrinsic_value(row, underlying_price):
+    if (row["security_type"] or "").upper() != "OPT":
         return None
 
     price = _float_or_none(underlying_price)
@@ -951,6 +958,23 @@ class TimeSeriesStore:
                 column = SYMBOL_BASIS_COLUMNS[basis]
                 start_positions = self._symbol_positions(conn, start["id"], column)
                 end_positions = self._symbol_positions(conn, end["id"], column)
+            execution_flows = self._execution_flows(
+                conn,
+                account_filter=account_filter,
+                start_as_of=start["as_of"],
+                end_as_of=end["as_of"],
+                level=level,
+            )
+            if level == "symbol":
+                for key, flow in self._inferred_option_exercise_flows(
+                    conn,
+                    account_filter=account_filter,
+                    start_id=start["id"],
+                    end_id=end["id"],
+                    start_as_of=start["as_of"],
+                    end_as_of=end["as_of"],
+                ).items():
+                    execution_flows[key] = execution_flows.get(key, 0.0) + flow
 
         rows = []
         for key in sorted(set(start_positions) | set(end_positions)):
@@ -974,6 +998,7 @@ class TimeSeriesStore:
                 after=after,
                 raw_value_delta=raw_value_delta,
                 basis=basis,
+                execution_flow=execution_flows.get(key),
             )
             rows.append(
                 {
@@ -1000,8 +1025,8 @@ class TimeSeriesStore:
                     "start_price": start_price,
                     "end_price": end_price,
                     "price_delta": (
-                        (end_price or 0.0) - (start_price or 0.0)
-                        if start_price is not None or end_price is not None
+                        end_price - start_price
+                        if start_price is not None and end_price is not None
                         else None
                     ),
                 }
@@ -1072,20 +1097,247 @@ class TimeSeriesStore:
             return None
         return (end or 0.0) - (start or 0.0)
 
+    def _execution_flows(
+        self,
+        conn,
+        account_filter: str,
+        start_as_of: float,
+        end_as_of: float,
+        level: str,
+    ) -> dict[str, float]:
+        """Return signed trade values within a comparison interval."""
+        if level != "symbol":
+            return {}
+
+        where = [
+            "CAST(strftime('%s', time) AS REAL) > ?",
+            "CAST(strftime('%s', time) AS REAL) <= ?",
+        ]
+        params: list = [float(start_as_of), float(end_as_of)]
+        if account_filter and account_filter != "ALL":
+            where.append("account = ?")
+            params.append(account_filter)
+
+        rows = conn.execute(
+            f"""
+            SELECT symbol, security_type, side, shares, price
+            FROM executions
+            WHERE {" AND ".join(where)}
+            """,
+            params,
+        ).fetchall()
+
+        flows: dict[str, float] = {}
+        for row in rows:
+            symbol = _text_or_none(row["symbol"])
+            if not symbol:
+                continue
+            shares = _float_or_none(row["shares"])
+            price = _float_or_none(row["price"])
+            if shares is None or price is None:
+                continue
+
+            side = (row["side"] or "").upper()
+            if side in {"BOT", "BUY"}:
+                sign = 1.0
+            elif side in {"SLD", "SELL"}:
+                sign = -1.0
+            else:
+                continue
+
+            multiplier = 100.0 if (row["security_type"] or "").upper() == "OPT" else 1.0
+            key = f"SYMBOL:{symbol}"
+            flows[key] = flows.get(key, 0.0) + sign * shares * price * multiplier
+        return flows
+
+    def _inferred_option_exercise_flows(
+        self,
+        conn,
+        account_filter: str,
+        start_id: int,
+        end_id: int,
+        start_as_of: float,
+        end_as_of: float,
+    ) -> dict[str, float]:
+        """
+        Infer cash flows from option exercise/assignment when IB has no fill.
+
+        TWS executions do not always include an explicit stock "buy" for an
+        exercised call or "sell" for an exercised put. Without that synthetic
+        flow, History treats the resulting share position as market P&L.
+        """
+        start_date = datetime.fromtimestamp(
+            float(start_as_of),
+            OPTION_EXERCISE_TIMEZONE,
+        ).date()
+        end_date = datetime.fromtimestamp(
+            float(end_as_of),
+            OPTION_EXERCISE_TIMEZONE,
+        ).date()
+        stock_quantities = self._stock_quantities_by_snapshot(conn, start_id, end_id)
+        stock_trade_shares = self._stock_execution_shares(
+            conn,
+            account_filter=account_filter,
+            start_as_of=start_as_of,
+            end_as_of=end_as_of,
+        )
+
+        unexplained_shares = {}
+        for symbol in set(stock_quantities) | set(stock_trade_shares):
+            quantities = stock_quantities.get(symbol, {})
+            raw_delta = quantities.get("end", 0.0) - quantities.get("start", 0.0)
+            unexplained = raw_delta - stock_trade_shares.get(symbol, 0.0)
+            if abs(unexplained) >= 1e-9:
+                unexplained_shares[symbol] = unexplained
+
+        if not unexplained_shares:
+            return {}
+
+        candidates = conn.execute(
+            """
+            SELECT s.symbol, s.quantity AS start_quantity,
+                   COALESCE(e.quantity, 0) AS end_quantity,
+                   s.expiry, s.strike, s.right, s.multiplier
+            FROM contract_snapshots s
+            LEFT JOIN contract_snapshots e
+              ON e.account_snapshot_id = ?
+             AND e.position_key = s.position_key
+            WHERE s.account_snapshot_id = ?
+              AND UPPER(s.security_type) = 'OPT'
+              AND s.quantity IS NOT NULL
+              AND s.quantity != 0
+            """,
+            (end_id, start_id),
+        ).fetchall()
+
+        flows: dict[str, float] = {}
+        remaining = dict(unexplained_shares)
+        for row in candidates:
+            symbol = _text_or_none(row["symbol"])
+            if not symbol or symbol not in remaining:
+                continue
+            expiry = _option_expiry_date(row["expiry"])
+            if expiry is None or expiry < start_date or expiry > end_date:
+                continue
+
+            start_quantity = _float_or_none(row["start_quantity"]) or 0.0
+            end_quantity = _float_or_none(row["end_quantity"]) or 0.0
+            if start_quantity == 0 or start_quantity * end_quantity < 0:
+                continue
+            closed_contracts = abs(start_quantity) - abs(end_quantity)
+            if closed_contracts <= 0:
+                continue
+
+            strike = _float_or_none(row["strike"])
+            multiplier = _float_or_none(row["multiplier"]) or 100.0
+            if strike is None or strike <= 0 or multiplier <= 0:
+                continue
+
+            right = (row["right"] or "").upper()
+            if right == "C":
+                share_direction = 1.0 if start_quantity > 0 else -1.0
+            elif right == "P":
+                share_direction = -1.0 if start_quantity > 0 else 1.0
+            else:
+                continue
+
+            candidate_shares = share_direction * closed_contracts * multiplier
+            shares_left = remaining[symbol]
+            if candidate_shares == 0 or candidate_shares * shares_left <= 0:
+                continue
+
+            inferred_shares = min(abs(candidate_shares), abs(shares_left))
+            signed_inferred_shares = share_direction * inferred_shares
+            key = f"SYMBOL:{symbol}"
+            flows[key] = flows.get(key, 0.0) + signed_inferred_shares * strike
+            remaining[symbol] = shares_left - signed_inferred_shares
+
+        return flows
+
+    @staticmethod
+    def _stock_quantities_by_snapshot(conn, start_id: int, end_id: int) -> dict[str, dict[str, float]]:
+        rows = conn.execute(
+            """
+            SELECT account_snapshot_id, symbol, SUM(quantity) AS quantity
+            FROM contract_snapshots
+            WHERE account_snapshot_id IN (?, ?)
+              AND UPPER(security_type) != 'OPT'
+            GROUP BY account_snapshot_id, symbol
+            """,
+            (start_id, end_id),
+        ).fetchall()
+        quantities: dict[str, dict[str, float]] = {}
+        for row in rows:
+            symbol = _text_or_none(row["symbol"])
+            if not symbol:
+                continue
+            bucket = quantities.setdefault(symbol, {"start": 0.0, "end": 0.0})
+            key = "start" if row["account_snapshot_id"] == start_id else "end"
+            bucket[key] = _float_or_none(row["quantity"]) or 0.0
+        return quantities
+
+    @staticmethod
+    def _stock_execution_shares(
+        conn,
+        account_filter: str,
+        start_as_of: float,
+        end_as_of: float,
+    ) -> dict[str, float]:
+        where = [
+            "CAST(strftime('%s', time) AS REAL) > ?",
+            "CAST(strftime('%s', time) AS REAL) <= ?",
+            "UPPER(security_type) != 'OPT'",
+        ]
+        params: list = [float(start_as_of), float(end_as_of)]
+        if account_filter and account_filter != "ALL":
+            where.append("account = ?")
+            params.append(account_filter)
+
+        rows = conn.execute(
+            f"""
+            SELECT symbol, side, shares
+            FROM executions
+            WHERE {" AND ".join(where)}
+            """,
+            params,
+        ).fetchall()
+
+        shares_by_symbol: dict[str, float] = {}
+        for row in rows:
+            symbol = _text_or_none(row["symbol"])
+            shares = _float_or_none(row["shares"])
+            if not symbol or shares is None:
+                continue
+            side = (row["side"] or "").upper()
+            if side in {"BOT", "BUY"}:
+                sign = 1.0
+            elif side in {"SLD", "SELL"}:
+                sign = -1.0
+            else:
+                continue
+            shares_by_symbol[symbol] = shares_by_symbol.get(symbol, 0.0) + sign * shares
+        return shares_by_symbol
+
     @staticmethod
     def _value_contribution(
         before: dict,
         after: dict,
         raw_value_delta: float,
         basis: str,
+        execution_flow: Optional[float] = None,
     ) -> tuple[float, float, str]:
         """
         Estimate how much a position contributed to NLV movement.
 
-        Raw market-value delta is noisy when quantity changes because new cash
-        deployed into a position shows up as "position value change."  For the
-        actual-value basis, subtract the estimated trade flow from the raw delta
-        when a cost basis is available:
+        Raw market-value delta is noisy when trades happen inside the interval
+        because cash deployed into, or withdrawn from, a position shows up as
+        "position value change."  When execution data is available, subtract
+        the signed execution flow from the raw delta:
+
+            contribution ~= value_delta - signed_execution_value
+
+        A buy has positive flow; a sale has negative flow. If execution data is
+        unavailable but quantity changed, fall back to cost-basis estimation:
 
             contribution ~= value_delta - quantity_delta * cost_basis
 
@@ -1094,6 +1346,13 @@ class TimeSeriesStore:
         """
         if basis != "market_value":
             return raw_value_delta, 0.0, "raw_value_delta"
+
+        if execution_flow is not None and abs(execution_flow) >= 1e-9:
+            return (
+                raw_value_delta - execution_flow,
+                execution_flow,
+                "execution_flow_adjusted",
+            )
 
         start_quantity = _float_or_none(before.get("quantity")) or 0.0
         end_quantity = _float_or_none(after.get("quantity")) or 0.0
@@ -1227,7 +1486,8 @@ class TimeSeriesStore:
         underlying_prices = self._snapshot_reliable_underlying_prices(conn, snapshot_id)
         rows = conn.execute(
             """
-            SELECT symbol, security_type, expiry, strike, right, quantity,
+            SELECT position_key, account_filter, symbol, security_type, expiry,
+                   strike, right, quantity,
                    market_price, market_value AS value, average_cost,
                    multiplier, price_source, as_of
             FROM contract_snapshots
@@ -1244,10 +1504,10 @@ class TimeSeriesStore:
                 f"SYMBOL:{symbol}",
                 {"stock_value": 0.0, "option_actual_value": 0.0, "market_value": 0.0},
             )
-            value = _sanitized_contract_market_value(
+            value = self._contract_value_with_fallback(
+                conn,
                 row,
                 underlying_price=underlying_prices.get(symbol),
-                as_of=row["as_of"],
             ) or 0.0
             if (row["security_type"] or "").upper() == "OPT":
                 entry["option_actual_value"] += value
@@ -1262,8 +1522,8 @@ class TimeSeriesStore:
         underlying_prices = self._snapshot_reliable_underlying_prices(conn, snapshot_id)
         rows = conn.execute(
             """
-            SELECT position_key, symbol, local_symbol, security_type, expiry,
-                   strike, right, quantity, market_price, average_cost,
+            SELECT position_key, account_filter, symbol, local_symbol,
+                   security_type, expiry, strike, right, quantity, market_price, average_cost,
                    multiplier, price_source, as_of, market_value AS value
             FROM contract_snapshots
             WHERE account_snapshot_id = ?
@@ -1278,14 +1538,58 @@ class TimeSeriesStore:
                 "quantity": row["quantity"],
                 "market_price": row["market_price"],
                 "cost_basis": row["average_cost"],
-                "value": _sanitized_contract_market_value(
+                "value": self._contract_value_with_fallback(
+                    conn,
                     row,
                     underlying_price=underlying_prices.get(row["symbol"]),
-                    as_of=row["as_of"],
                 ),
             }
             for row in rows
         }
+
+    def _contract_value_with_fallback(
+        self,
+        conn,
+        row,
+        underlying_price: Optional[float],
+    ) -> Optional[float]:
+        value = _sanitized_contract_market_value(
+            row,
+            underlying_price=underlying_price,
+            as_of=row["as_of"],
+        )
+        if (row["price_source"] or "").lower() != "unavailable":
+            return value
+
+        prior = conn.execute(
+            """
+            SELECT market_value AS value, price_source, security_type, quantity,
+                   market_price, average_cost, multiplier, expiry, strike, right,
+                   as_of
+            FROM contract_snapshots
+            WHERE account_filter = ?
+              AND position_key = ?
+              AND as_of < ?
+              AND date(as_of, 'unixepoch', 'localtime') =
+                  date(?, 'unixepoch', 'localtime')
+              AND price_source NOT IN ('unavailable', 'cost_basis')
+            ORDER BY as_of DESC
+            LIMIT 1
+            """,
+            (
+                row["account_filter"],
+                row["position_key"],
+                row["as_of"],
+                row["as_of"],
+            ),
+        ).fetchone()
+        if prior is None:
+            return value
+        return _sanitized_contract_market_value(
+            prior,
+            underlying_price=underlying_price,
+            as_of=row["as_of"],
+        )
 
     def _snapshot_reliable_underlying_prices(self, conn, snapshot_id: int) -> dict:
         placeholders = ",".join("?" for _ in RELIABLE_UNDERLYING_PRICE_SOURCES)

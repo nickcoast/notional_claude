@@ -3,7 +3,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -288,6 +288,444 @@ class TimeSeriesStoreTest(unittest.TestCase):
             row["delta_value"] + reconciliation["delta_value"],
             comparison["net_liquidation_delta"],
         )
+
+    def test_symbol_comparison_uses_execution_flows_for_sold_stock(self):
+        start_as_of = 1700000200.0
+        end_as_of = 1700000300.0
+        first = {
+            "as_of": start_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "SALE",
+                    "stock_count": 10.0,
+                    "underlying_market_price": 100.0,
+                    "underlying_cost_basis": 50.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 1000.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 1000.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": end_as_of,
+            "metrics": {"net_liquidation": 1025.0},
+            "positions": [
+                {
+                    "symbol": "SALE",
+                    "stock_count": 5.0,
+                    "underlying_market_price": 110.0,
+                    "underlying_cost_basis": 50.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 550.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 550.0,
+                }
+            ],
+        }
+
+        first_id = self.store.insert_snapshot(first, "TEST_ACCOUNT")
+        second_id = self.store.insert_snapshot(second, "TEST_ACCOUNT")
+        self.store.insert_executions([
+            {
+                "exec_id": "sale-1",
+                "time": datetime.fromtimestamp(
+                    start_as_of + 20,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "SALE",
+                "local_symbol": "SALE",
+                "security_type": "STK",
+                "side": "SLD",
+                "shares": 5,
+                "price": 108.0,
+                "avg_price": 108.0,
+            }
+        ])
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "SALE")
+        self.assertAlmostEqual(row["raw_value_delta"], -450.0)
+        self.assertAlmostEqual(row["flow_adjustment"], -540.0)
+        self.assertAlmostEqual(row["delta_value"], 90.0)
+        self.assertEqual(row["contribution_source"], "execution_flow_adjusted")
+
+    def test_closed_position_does_not_report_zero_price_delta(self):
+        start_as_of = 1700000200.0
+        end_as_of = 1700000300.0
+        first = {
+            "as_of": start_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "CLOSED",
+                    "stock_count": -10.0,
+                    "underlying_market_price": 425.0,
+                    "underlying_cost_basis": 428.0,
+                    "underlying_price_source": "portfolio",
+                    "stock_value": -4250.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": -4250.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": end_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [],
+        }
+
+        first_id = self.store.insert_snapshot(first, "TEST_ACCOUNT")
+        second_id = self.store.insert_snapshot(second, "TEST_ACCOUNT")
+        self.store.insert_executions([
+            {
+                "exec_id": "cover-1",
+                "time": datetime.fromtimestamp(
+                    start_as_of + 20,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "CLOSED",
+                "local_symbol": "CLOSED",
+                "security_type": "STK",
+                "side": "BOT",
+                "shares": 10,
+                "price": 441.0,
+                "avg_price": 441.0,
+            }
+        ])
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "CLOSED")
+        self.assertIsNone(row["end_price"])
+        self.assertIsNone(row["price_delta"])
+        self.assertAlmostEqual(row["delta_value"], -160.0)
+
+    def test_symbol_comparison_infers_option_exercise_stock_flow(self):
+        start_as_of = datetime(
+            2026,
+            5,
+            8,
+            16,
+            34,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        end_as_of = datetime(
+            2026,
+            5,
+            11,
+            4,
+            18,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        start = {
+            "as_of": start_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "DDOG",
+                    "stock_count": 175.0,
+                    "underlying_market_price": 200.75,
+                    "underlying_cost_basis": 147.83,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 35131.25,
+                    "option_actual_value": 450.0,
+                    "option_notional_value": 0.0,
+                    "npv": 35131.25,
+                }
+            ],
+        }
+        end = {
+            "as_of": end_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "DDOG",
+                    "stock_count": 575.0,
+                    "underlying_market_price": 198.64,
+                    "underlying_cost_basis": 188.61,
+                    "underlying_price_source": "portfolio",
+                    "stock_value": 114218.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 114218.0,
+                }
+            ],
+        }
+        start_id = self.store.insert_snapshot(
+            start,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "DDOG",
+                    "local_symbol": "DDOG",
+                    "security_type": "STK",
+                    "con_id": 1,
+                    "quantity": 175,
+                    "market_price": 200.75,
+                    "market_value": 35131.25,
+                    "average_cost": 147.83,
+                    "price_source": "snapshot",
+                },
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "DDOG",
+                    "local_symbol": "DDOG 260508C00200000",
+                    "security_type": "OPT",
+                    "con_id": 2,
+                    "expiry": "20260508",
+                    "strike": 200.0,
+                    "right": "C",
+                    "quantity": 6,
+                    "market_price": 0.75,
+                    "market_value": 450.0,
+                    "multiplier": 100,
+                    "price_source": "option_market_data",
+                },
+            ],
+        )
+        end_id = self.store.insert_snapshot(
+            end,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "DDOG",
+                    "local_symbol": "DDOG",
+                    "security_type": "STK",
+                    "con_id": 1,
+                    "quantity": 575,
+                    "market_price": 198.64,
+                    "market_value": 114218.0,
+                    "average_cost": 188.61,
+                    "price_source": "portfolio",
+                }
+            ],
+        )
+        self.store.insert_executions([
+            {
+                "exec_id": "ddog-sale-1",
+                "time": datetime.fromtimestamp(
+                    end_as_of - 120,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "DDOG",
+                "local_symbol": "DDOG",
+                "security_type": "STK",
+                "side": "SLD",
+                "shares": 200,
+                "price": 198.95,
+                "avg_price": 198.95,
+            }
+        ])
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=start_id,
+            end_id=end_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "DDOG")
+        self.assertAlmostEqual(row["raw_value_delta"], 78636.75)
+        self.assertAlmostEqual(row["flow_adjustment"], 80210.0)
+        self.assertAlmostEqual(row["delta_value"], -1573.25)
+        self.assertEqual(row["contribution_source"], "execution_flow_adjusted")
+
+    def test_symbol_comparison_uses_last_contract_mark_when_quote_unavailable(self):
+        first = {
+            "as_of": 1700000400.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "OPT",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 100.0,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 300.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        second = {
+            "as_of": 1700000500.0,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "OPT",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 100.0,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 0.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        valid_contract = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "OPT",
+            "local_symbol": "OPT 260618C00100000",
+            "security_type": "OPT",
+            "con_id": 7001,
+            "expiry": "20260618",
+            "strike": 100.0,
+            "right": "C",
+            "quantity": 3,
+            "market_price": 1.0,
+            "market_value": 300.0,
+            "multiplier": 100,
+            "price_source": "option_market_data",
+        }
+        unavailable_contract = dict(valid_contract)
+        unavailable_contract.update({
+            "market_price": 0.0,
+            "market_value": 0.0,
+            "price_source": "unavailable",
+        })
+
+        first_id = self.store.insert_snapshot(
+            first,
+            "TEST_ACCOUNT",
+            contract_positions=[valid_contract],
+        )
+        second_id = self.store.insert_snapshot(
+            second,
+            "TEST_ACCOUNT",
+            contract_positions=[unavailable_contract],
+        )
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=first_id,
+            end_id=second_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "OPT")
+        self.assertAlmostEqual(row["start_value"], 300.0)
+        self.assertAlmostEqual(row["end_value"], 300.0)
+        self.assertAlmostEqual(row["delta_value"], 0.0)
+
+    def test_expired_otm_option_ignores_stale_market_value_after_cutoff(self):
+        start_ts = datetime(
+            2026,
+            5,
+            8,
+            13,
+            39,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        end_ts = datetime(
+            2026,
+            5,
+            8,
+            16,
+            7,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        start = {
+            "as_of": start_ts,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "QQQ",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 711.14,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 20.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        end = {
+            "as_of": end_ts,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "QQQ",
+                    "stock_count": 0.0,
+                    "underlying_market_price": 711.70,
+                    "underlying_cost_basis": 0.0,
+                    "underlying_price_source": "snapshot",
+                    "stock_value": 0.0,
+                    "option_actual_value": 8340.0,
+                    "option_notional_value": 0.0,
+                    "npv": 0.0,
+                }
+            ],
+        }
+        start_contract = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "QQQ",
+            "local_symbol": "QQQ 260508P00703000",
+            "security_type": "OPT",
+            "con_id": 8001,
+            "expiry": "20260508",
+            "strike": 703.0,
+            "right": "P",
+            "quantity": 10,
+            "market_price": 0.02,
+            "market_value": 20.0,
+            "multiplier": 100,
+            "price_source": "option_market_data",
+        }
+        stale_end_contract = dict(start_contract)
+        stale_end_contract.update({
+            "market_price": 8.34,
+            "market_value": 8340.0,
+            "price_source": "option_market_data",
+        })
+
+        start_id = self.store.insert_snapshot(
+            start,
+            "TEST_ACCOUNT",
+            contract_positions=[start_contract],
+        )
+        end_id = self.store.insert_snapshot(
+            end,
+            "TEST_ACCOUNT",
+            contract_positions=[stale_end_contract],
+        )
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=start_id,
+            end_id=end_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "QQQ")
+        self.assertAlmostEqual(row["start_value"], 20.0)
+        self.assertAlmostEqual(row["end_value"], 0.0)
+        self.assertAlmostEqual(row["delta_value"], -20.0)
 
     def test_contract_level_comparison_uses_contract_marks(self):
         first = {

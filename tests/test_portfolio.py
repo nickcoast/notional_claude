@@ -9,7 +9,11 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from portfolio import option_intrinsic_floor_value  # noqa: E402
+from portfolio import (  # noqa: E402
+    option_after_exercise_cutoff,
+    option_intrinsic_floor_value,
+    option_intrinsic_value,
+)
 
 
 class PortfolioOptionValueTest(unittest.TestCase):
@@ -62,6 +66,32 @@ class PortfolioOptionValueTest(unittest.TestCase):
         )
 
         self.assertIsNone(floor_value)
+
+    def test_expired_otm_put_has_zero_intrinsic_value_after_cutoff(self):
+        contract = SimpleNamespace(
+            lastTradeDateOrContractMonth="20260508",
+            strike=703.0,
+            right="P",
+        )
+        now_ts = datetime(
+            2026,
+            5,
+            8,
+            16,
+            7,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+
+        self.assertTrue(option_after_exercise_cutoff(contract, now_ts))
+        self.assertEqual(
+            option_intrinsic_value(
+                contract,
+                underlying_price=711.70,
+                quantity=10,
+                multiplier=100,
+            ),
+            0.0,
+        )
 
 
 if __name__ == "__main__":
