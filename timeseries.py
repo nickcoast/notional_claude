@@ -1132,6 +1132,9 @@ class TimeSeriesStore:
             symbol = _text_or_none(row["symbol"])
             if not symbol:
                 continue
+            security_type = (row["security_type"] or "").upper()
+            if security_type not in {"STK", "OPT"}:
+                continue
             shares = _float_or_none(row["shares"])
             price = _float_or_none(row["price"])
             if shares is None or price is None:
@@ -1145,7 +1148,7 @@ class TimeSeriesStore:
             else:
                 continue
 
-            multiplier = 100.0 if (row["security_type"] or "").upper() == "OPT" else 1.0
+            multiplier = 100.0 if security_type == "OPT" else 1.0
             key = f"SYMBOL:{symbol}"
             flows[key] = flows.get(key, 0.0) + sign * shares * price * multiplier
         return flows
@@ -1261,7 +1264,7 @@ class TimeSeriesStore:
             SELECT account_snapshot_id, symbol, SUM(quantity) AS quantity
             FROM contract_snapshots
             WHERE account_snapshot_id IN (?, ?)
-              AND UPPER(security_type) != 'OPT'
+              AND UPPER(security_type) = 'STK'
             GROUP BY account_snapshot_id, symbol
             """,
             (start_id, end_id),
@@ -1286,7 +1289,7 @@ class TimeSeriesStore:
         where = [
             "CAST(strftime('%s', time) AS REAL) > ?",
             "CAST(strftime('%s', time) AS REAL) <= ?",
-            "UPPER(security_type) != 'OPT'",
+            "UPPER(security_type) = 'STK'",
         ]
         params: list = [float(start_as_of), float(end_as_of)]
         if account_filter and account_filter != "ALL":

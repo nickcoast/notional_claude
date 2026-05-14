@@ -418,6 +418,183 @@ class TimeSeriesStoreTest(unittest.TestCase):
         self.assertIsNone(row["price_delta"])
         self.assertAlmostEqual(row["delta_value"], -160.0)
 
+    def test_combo_bag_executions_do_not_create_stock_flow(self):
+        start_as_of = datetime(
+            2026,
+            5,
+            11,
+            6,
+            38,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        end_as_of = datetime(
+            2026,
+            5,
+            13,
+            1,
+            13,
+            tzinfo=ZoneInfo("America/Los_Angeles"),
+        ).timestamp()
+        start = {
+            "as_of": start_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "QQQ",
+                    "stock_count": 1.25,
+                    "underlying_market_price": 711.40,
+                    "underlying_cost_basis": 506.42,
+                    "underlying_price_source": "portfolio",
+                    "stock_value": 889.25,
+                    "option_actual_value": 30.50,
+                    "option_notional_value": 0.0,
+                    "npv": 889.25,
+                }
+            ],
+        }
+        end = {
+            "as_of": end_as_of,
+            "metrics": {"net_liquidation": 1000.0},
+            "positions": [
+                {
+                    "symbol": "QQQ",
+                    "stock_count": 1.25,
+                    "underlying_market_price": 713.17,
+                    "underlying_cost_basis": 506.42,
+                    "underlying_price_source": "portfolio",
+                    "stock_value": 891.46,
+                    "option_actual_value": 21.62,
+                    "option_notional_value": 0.0,
+                    "npv": 891.46,
+                }
+            ],
+        }
+        start_id = self.store.insert_snapshot(
+            start,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "QQQ",
+                    "local_symbol": "QQQ",
+                    "security_type": "STK",
+                    "con_id": 1,
+                    "quantity": 1.25,
+                    "market_price": 711.40,
+                    "market_value": 889.25,
+                    "average_cost": 506.42,
+                    "price_source": "portfolio",
+                },
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "QQQ",
+                    "local_symbol": "QQQ 260511P00693000",
+                    "security_type": "OPT",
+                    "con_id": 2,
+                    "expiry": "20260511",
+                    "strike": 693.0,
+                    "right": "P",
+                    "quantity": 3,
+                    "market_price": 0.10,
+                    "market_value": 30.0,
+                    "multiplier": 100,
+                    "price_source": "ib_portfolio",
+                },
+            ],
+        )
+        end_id = self.store.insert_snapshot(
+            end,
+            "TEST_ACCOUNT",
+            contract_positions=[
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "QQQ",
+                    "local_symbol": "QQQ",
+                    "security_type": "STK",
+                    "con_id": 1,
+                    "quantity": 1.25,
+                    "market_price": 713.17,
+                    "market_value": 891.46,
+                    "average_cost": 506.42,
+                    "price_source": "portfolio",
+                },
+                {
+                    "account": "TEST_ACCOUNT",
+                    "symbol": "QQQ",
+                    "local_symbol": "QQQ 260513P00691000",
+                    "security_type": "OPT",
+                    "con_id": 3,
+                    "expiry": "20260513",
+                    "strike": 691.0,
+                    "right": "P",
+                    "quantity": 5,
+                    "market_price": 0.04324,
+                    "market_value": 21.62,
+                    "multiplier": 100,
+                    "price_source": "ib_portfolio",
+                },
+            ],
+        )
+        self.store.insert_executions([
+            {
+                "exec_id": "combo-parent",
+                "time": datetime.fromtimestamp(
+                    start_as_of + 100,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "QQQ",
+                "local_symbol": "QQQ",
+                "security_type": "BAG",
+                "side": "BOT",
+                "shares": 3,
+                "price": 0.31,
+                "avg_price": 0.31,
+            },
+            {
+                "exec_id": "combo-short-leg",
+                "time": datetime.fromtimestamp(
+                    start_as_of + 100,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "QQQ",
+                "local_symbol": "QQQ 260512P00694000",
+                "security_type": "OPT",
+                "side": "SLD",
+                "shares": 3,
+                "price": 0.32,
+                "avg_price": 0.32,
+            },
+            {
+                "exec_id": "combo-long-leg",
+                "time": datetime.fromtimestamp(
+                    start_as_of + 100,
+                    timezone.utc,
+                ).isoformat(sep=" "),
+                "account": "TEST_ACCOUNT",
+                "symbol": "QQQ",
+                "local_symbol": "QQQ 260512P00700000",
+                "security_type": "OPT",
+                "side": "BOT",
+                "shares": 3,
+                "price": 0.63,
+                "avg_price": 0.63,
+            },
+        ])
+
+        comparison = self.store.compare_positions(
+            "TEST_ACCOUNT",
+            start_id=start_id,
+            end_id=end_id,
+            basis="market_value",
+        )
+
+        row = next(row for row in comparison["rows"] if row["symbol"] == "QQQ")
+        self.assertAlmostEqual(row["raw_value_delta"], -6.17)
+        self.assertAlmostEqual(row["flow_adjustment"], 93.0)
+        self.assertAlmostEqual(row["delta_value"], -99.17)
+
     def test_symbol_comparison_infers_option_exercise_stock_flow(self):
         start_as_of = datetime(
             2026,
