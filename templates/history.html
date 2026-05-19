@@ -146,6 +146,7 @@
         const compareButton = document.getElementById('compare-button');
 
         function money(value) {
+            if (value === null || value === undefined || value === '') return '-';
             const number = Number(value);
             if (!Number.isFinite(number)) return '-';
             return new Intl.NumberFormat(undefined, {
@@ -155,13 +156,53 @@
             }).format(number);
         }
 
+        function moneyWithDecimals(value, decimals) {
+            if (value === null || value === undefined || value === '') return '-';
+            const number = Number(value);
+            if (!Number.isFinite(number)) return '-';
+            return new Intl.NumberFormat(undefined, {
+                style: 'currency',
+                currency: 'USD',
+                minimumFractionDigits: decimals,
+                maximumFractionDigits: decimals,
+            }).format(number);
+        }
+
         function number(value, decimals) {
+            if (value === null || value === undefined || value === '') return '-';
             const parsed = Number(value);
             if (!Number.isFinite(parsed)) return '-';
             return parsed.toLocaleString(undefined, {
                 minimumFractionDigits: decimals,
                 maximumFractionDigits: decimals,
             });
+        }
+
+        function hasNetLiquidation(point) {
+            return point
+                && point.net_liquidation !== null
+                && point.net_liquidation !== undefined
+                && point.net_liquidation !== ''
+                && Number.isFinite(Number(point.net_liquidation));
+        }
+
+        function priceDelta(row) {
+            const delta = Number(row.price_delta);
+            if (!Number.isFinite(delta)) return '-';
+            const type = String(row.security_type || '').toUpperCase();
+            const stockLike = type === 'STK' || type === 'UNDERLYING_AGG';
+            let decimals = 0;
+            if (stockLike) {
+                const end = Number(row.end_price);
+                const start = Number(row.start_price);
+                const reference = Number.isFinite(end) && end > 0 ? end : start;
+                if (Number.isFinite(reference) && reference > 0 && reference < 10) {
+                    decimals = 2;
+                } else if (Number.isFinite(reference) && reference > 0 && reference < 100) {
+                    decimals = 1;
+                }
+            }
+            return moneyWithDecimals(delta, decimals);
         }
 
         function timeLabel(ts) {
@@ -305,9 +346,7 @@
 
         function chartGeometry(width, height, points) {
             const pad = { left: 68, right: 16, top: 18, bottom: 34 };
-            const values = points
-                .map(function (point) { return Number(point.net_liquidation); })
-                .filter(Number.isFinite);
+            const values = points.map(function (point) { return Number(point.net_liquidation); });
             const times = points
                 .map(function (point) { return Number(point.as_of); })
                 .filter(Number.isFinite);
@@ -354,9 +393,7 @@
             ctx.fillStyle = '#030712';
             ctx.fillRect(0, 0, width, height);
 
-            const points = state.points.filter(function (point) {
-                return Number.isFinite(Number(point.net_liquidation));
-            });
+            const points = state.points.filter(hasNetLiquidation);
             if (!points.length) {
                 ctx.fillStyle = '#4b5563';
                 ctx.font = '12px ui-monospace, monospace';
@@ -424,9 +461,7 @@
         function nearestPoint(clientX) {
             const rect = canvas.getBoundingClientRect();
             const width = Math.max(rect.width, 320);
-            const points = state.points.filter(function (point) {
-                return Number.isFinite(Number(point.net_liquidation));
-            });
+            const points = state.points.filter(hasNetLiquidation);
             if (!points.length) return null;
             const geo = chartGeometry(width, 320, points);
             const x = clientX - rect.left;
@@ -449,7 +484,7 @@
             const response = await fetch('/history.json?' + params.toString());
             if (!response.ok) throw new Error('history fetch failed');
             const data = await response.json();
-            state.points = data.points || [];
+            state.points = (data.points || []).filter(hasNetLiquidation);
             state.account = data.account || '-';
             accountEl.textContent = data.account_display || selectedAccountDisplay();
             accountEl.title = state.account;
@@ -525,7 +560,7 @@
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-400">' + money(row.stock_delta_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-400">' + money(row.option_actual_delta_value) + '</td>'
                     + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + number(row.quantity_delta, 2) + '</td>'
-                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + money(row.price_delta) + '</td>'
+                    + '<td class="py-1.5 px-2 text-right tabular-nums text-gray-300">' + priceDelta(row) + '</td>'
                     + '<td class="py-1.5 pl-2 text-gray-500">' + esc(row.security_type || '-') + '</td>'
                     + '</tr>';
             }).join('');
