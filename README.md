@@ -126,6 +126,8 @@ exposes a provider/article id for each article, but not a separate canonical
 The history page persists one SQLite row per successful poll. Restarting the app
 reloads the existing `history.sqlite3` data and appends new snapshots. Account
 snapshots store Net Liquidation and other account-level metrics for charting.
+Polls without Net Liquidation are treated as failed/incomplete for storage, so
+locally cached or stale data is not written as fresh account history.
 History defaults to the current calendar day and has its own account selector,
 using account nicknames from `config.json`. The SQLite schema stores
 `account_filter` on account, symbol, contract, and daily-extreme rows, so it can
@@ -161,6 +163,11 @@ Net Liquidation values are rolled up as snapshots arrive.
 - Investigate whether IB's option portfolio marks are closest to bid/ask
   midpoint, model price, or another mark before adding alternate option-price
   bases to history comparisons.
+- Reduce time-series database growth for `position_snapshots` and
+  `contract_snapshots`. These tables can contain long runs of identical state,
+  especially outside market and extended-hours sessions. Future compaction
+  should preserve real price and quantity changes while representing unchanged
+  runs with segment boundaries or another reconstructable form.
 - Add configurable table columns. Portfolio and order tables should support
   drag-to-reorder columns plus a column-visibility menu, likely behind a gear
   icon with checkboxes. Hidden columns should still be fetched and kept current
