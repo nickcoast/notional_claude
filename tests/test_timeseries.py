@@ -77,6 +77,182 @@ class TimeSeriesStoreTest(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
+    def order_segments(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM order_snapshots
+                ORDER BY first_seen_at, id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_legacy_order_schema(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE order_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    as_of REAL NOT NULL,
+                    account_filter TEXT NOT NULL,
+                    order_key TEXT NOT NULL,
+                    account TEXT,
+                    symbol TEXT,
+                    local_symbol TEXT,
+                    security_type TEXT,
+                    action TEXT,
+                    order_type TEXT,
+                    total_quantity REAL,
+                    limit_price REAL,
+                    aux_price REAL,
+                    time_in_force TEXT,
+                    status TEXT,
+                    filled REAL,
+                    remaining REAL,
+                    is_filled INTEGER NOT NULL DEFAULT 0,
+                    exchange TEXT,
+                    currency TEXT,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    parent_id INTEGER,
+                    current_price REAL,
+                    order_price REAL,
+                    price_distance_pct REAL,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(account_filter, as_of, order_key)
+                );
+                CREATE INDEX idx_order_snapshots_account_asof
+                    ON order_snapshots(account_filter, as_of);
+                CREATE INDEX idx_order_snapshots_order
+                    ON order_snapshots(perm_id, order_id);
+
+                CREATE TABLE executions (
+                    exec_id TEXT PRIMARY KEY,
+                    time TEXT,
+                    account TEXT,
+                    symbol TEXT,
+                    local_symbol TEXT,
+                    security_type TEXT,
+                    side TEXT,
+                    shares REAL,
+                    price REAL,
+                    avg_price REAL,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    client_id INTEGER,
+                    con_id INTEGER,
+                    exchange TEXT,
+                    currency TEXT,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
+    def insert_legacy_order(self, as_of, **overrides):
+        order = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "AAPL",
+            "local_symbol": "AAPL",
+            "security_type": "STK",
+            "action": "BUY",
+            "order_type": "LMT",
+            "total_quantity": 10,
+            "limit_price": 190.0,
+            "aux_price": 0.0,
+            "time_in_force": "DAY",
+            "status": "Submitted",
+            "filled": 0.0,
+            "remaining": 10.0,
+            "is_filled": False,
+            "exchange": "SMART",
+            "currency": "USD",
+            "order_id": 11,
+            "perm_id": 22,
+            "parent_id": 0,
+            "current_price": 191.0,
+            "order_price": 190.0,
+            "price_distance_pct": 0.52,
+        }
+        order.update(overrides)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO order_snapshots (
+                    as_of, account_filter, order_key, account, symbol,
+                    local_symbol, security_type, action, order_type,
+                    total_quantity, limit_price, aux_price, time_in_force,
+                    status, filled, remaining, is_filled, exchange, currency,
+                    order_id, perm_id, parent_id, current_price, order_price,
+                    price_distance_pct, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    as_of,
+                    "TEST_ACCOUNT",
+                    "PERM:22|ORDER:11",
+                    order["account"],
+                    order["symbol"],
+                    order["local_symbol"],
+                    order["security_type"],
+                    order["action"],
+                    order["order_type"],
+                    order["total_quantity"],
+                    order["limit_price"],
+                    order["aux_price"],
+                    order["time_in_force"],
+                    order["status"],
+                    order["filled"],
+                    order["remaining"],
+                    1 if order["is_filled"] else 0,
+                    order["exchange"],
+                    order["currency"],
+                    order["order_id"],
+                    order["perm_id"],
+                    order["parent_id"],
+                    order["current_price"],
+                    order["order_price"],
+                    order["price_distance_pct"],
+                    json.dumps(order, sort_keys=True),
+                ),
+            )
+
+    def insert_execution(self, exec_id="0001.01", time="1970-01-01T00:16:30+00:00"):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO executions (
+                    exec_id, time, account, symbol, local_symbol, security_type,
+                    side, shares, price, avg_price, order_id, perm_id,
+                    client_id, con_id, exchange, currency, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    exec_id,
+                    time,
+                    "TEST_ACCOUNT",
+                    "AAPL",
+                    "AAPL",
+                    "STK",
+                    "BOT",
+                    10,
+                    190.0,
+                    190.0,
+                    11,
+                    22,
+                    1234,
+                    265598,
+                    "SMART",
+                    "USD",
+                    "{}",
+                ),
+            )
+
     def test_live_fixture_inserts_history_and_daily_extremes(self):
         fixture, _ids = self.insert_fixture()
 
@@ -116,6 +292,24 @@ class TimeSeriesStoreTest(unittest.TestCase):
         self.assertEqual(duplicate_id, first_id)
         self.assertEqual(self.account_snapshot_count(), 1)
 
+    def test_snapshot_without_net_liquidation_is_not_persisted(self):
+        snapshot_id = self.store.insert_snapshot(
+            {"as_of": 1000.0, "metrics": {}, "positions": []},
+            account_filter="TEST_ACCOUNT",
+        )
+
+        self.assertIsNone(snapshot_id)
+        self.assertEqual(self.account_snapshot_count(), 0)
+
+    def test_zero_net_liquidation_snapshot_can_be_persisted(self):
+        snapshot_id = self.store.insert_snapshot(
+            {"as_of": 1000.0, "metrics": {"net_liquidation": 0.0}, "positions": []},
+            account_filter="TEST_ACCOUNT",
+        )
+
+        self.assertIsNotNone(snapshot_id)
+        self.assertEqual(self.account_snapshot_count(), 1)
+
     def test_order_snapshots_and_executions_are_persisted(self):
         orders = [
             {
@@ -132,6 +326,8 @@ class TimeSeriesStoreTest(unittest.TestCase):
                 "remaining": 10,
                 "order_id": 11,
                 "perm_id": 22,
+                "con_id": 265598,
+                "client_id": 1234,
                 "order_price": 190.0,
                 "current_price": 191.0,
                 "price_distance_pct": 0.52,
@@ -168,6 +364,196 @@ class TimeSeriesStoreTest(unittest.TestCase):
         self.assertEqual(self.table_count("order_snapshots"), 1)
         self.assertEqual(self.table_count("executions"), 1)
         self.assertEqual(self.store.get_recent_executions()[0]["exec_id"], "0001.01")
+
+    def test_perm_id_order_key_ignores_con_id(self):
+        key = self.store._order_snapshot_key({
+            "perm_id": 22,
+            "order_id": 0,
+            "con_id": 265598,
+        })
+
+        self.assertEqual(key, "PERM:22|ORDER:0")
+
+    def test_order_snapshot_updates_market_fields_without_new_segment(self):
+        order = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "AAPL",
+            "local_symbol": "AAPL",
+            "security_type": "STK",
+            "con_id": 265598,
+            "action": "BUY",
+            "order_type": "LMT",
+            "total_quantity": 10,
+            "limit_price": 190.0,
+            "status": "Submitted",
+            "filled": 0,
+            "remaining": 10,
+            "order_id": 11,
+            "perm_id": 22,
+            "client_id": 1234,
+            "order_price": 190.0,
+            "current_price": 191.0,
+            "price_distance_pct": 0.52,
+        }
+
+        self.assertEqual(self.store.insert_order_snapshot(1000.0, "TEST_ACCOUNT", [order]), 1)
+        updated = dict(order, current_price=192.0, price_distance_pct=1.04)
+        self.assertEqual(self.store.insert_order_snapshot(1010.0, "TEST_ACCOUNT", [updated]), 0)
+
+        segments = self.order_segments()
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["first_seen_at"], 1000.0)
+        self.assertEqual(segments[0]["last_seen_at"], 1010.0)
+        self.assertEqual(segments[0]["current_price"], 192.0)
+        self.assertNotIn("current_price", segments[0]["state_json"])
+
+    def test_order_snapshot_price_change_creates_new_segment(self):
+        order = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "AAPL",
+            "security_type": "STK",
+            "action": "SELL",
+            "order_type": "STP LMT",
+            "total_quantity": 10,
+            "limit_price": 190.0,
+            "aux_price": 189.0,
+            "status": "PreSubmitted",
+            "filled": 0,
+            "remaining": 10,
+            "order_id": 11,
+            "perm_id": 22,
+            "order_price": 189.0,
+        }
+
+        self.store.insert_order_snapshot(1000.0, "TEST_ACCOUNT", [order])
+        self.store.insert_order_snapshot(
+            1010.0,
+            "TEST_ACCOUNT",
+            [dict(order, aux_price=188.5, order_price=188.5)],
+        )
+
+        segments = self.order_segments()
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["ended_at"], 1010.0)
+        self.assertEqual(segments[1]["aux_price"], 188.5)
+
+    def test_missing_order_closes_only_after_complete_poll(self):
+        order = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "AAPL",
+            "security_type": "STK",
+            "action": "BUY",
+            "order_type": "LMT",
+            "total_quantity": 10,
+            "limit_price": 190.0,
+            "status": "Submitted",
+            "filled": 0,
+            "remaining": 10,
+            "order_id": 11,
+            "perm_id": 22,
+        }
+
+        self.store.insert_order_snapshot(1000.0, "TEST_ACCOUNT", [order])
+        self.store.insert_order_snapshot(1010.0, "TEST_ACCOUNT", [], complete=False)
+        self.assertIsNone(self.order_segments()[0]["ended_at"])
+
+        self.store.insert_order_snapshot(1020.0, "TEST_ACCOUNT", [], complete=True)
+        self.assertEqual(self.order_segments()[0]["ended_at"], 1020.0)
+
+    def test_legacy_order_migration_collapses_repeated_state(self):
+        self.tmpdir.cleanup()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "history.sqlite3"
+        self.create_legacy_order_schema()
+        self.insert_legacy_order(1000.0, current_price=191.0, price_distance_pct=0.52)
+        self.insert_legacy_order(1010.0, current_price=192.0, price_distance_pct=1.04)
+        self.insert_legacy_order(1020.0, limit_price=191.0, order_price=191.0)
+
+        self.store = TimeSeriesStore(self.db_path)
+
+        self.assertEqual(self.table_count("order_snapshots_legacy"), 3)
+        segments = self.order_segments()
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["first_seen_at"], 1000.0)
+        self.assertEqual(segments[0]["last_seen_at"], 1010.0)
+        self.assertEqual(segments[0]["ended_at"], 1020.0)
+        self.assertEqual(segments[0]["current_price"], 192.0)
+        self.assertEqual(segments[1]["limit_price"], 191.0)
+
+    def test_legacy_filled_order_uses_execution_terminal_time(self):
+        self.tmpdir.cleanup()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "history.sqlite3"
+        self.create_legacy_order_schema()
+        self.insert_execution(time="1970-01-01T00:16:30+00:00")
+        self.insert_legacy_order(
+            1000.0,
+            status="Filled",
+            filled=10.0,
+            remaining=0.0,
+            is_filled=True,
+        )
+
+        self.store = TimeSeriesStore(self.db_path)
+
+        segment = self.order_segments()[0]
+        self.assertEqual(segment["terminal_at"], 990.0)
+        self.assertEqual(segment["terminal_source"], "execution")
+        self.assertEqual(segment["ended_at"], 990.0)
+
+    def test_legacy_filled_order_falls_back_to_observed_terminal_time(self):
+        self.tmpdir.cleanup()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "history.sqlite3"
+        self.create_legacy_order_schema()
+        self.insert_legacy_order(
+            1000.0,
+            status="Filled",
+            filled=10.0,
+            remaining=0.0,
+            is_filled=True,
+        )
+
+        self.store = TimeSeriesStore(self.db_path)
+
+        segment = self.order_segments()[0]
+        self.assertEqual(segment["terminal_at"], 1000.0)
+        self.assertEqual(segment["terminal_source"], "observed")
+
+    def test_startup_normalizes_con_id_order_key_for_perm_id(self):
+        order = {
+            "account": "TEST_ACCOUNT",
+            "symbol": "AAPL",
+            "security_type": "STK",
+            "con_id": 265598,
+            "action": "BUY",
+            "order_type": "LMT",
+            "total_quantity": 10,
+            "limit_price": 190.0,
+            "status": "Submitted",
+            "filled": 0,
+            "remaining": 10,
+            "order_id": 0,
+            "perm_id": 22,
+        }
+        self.store.insert_order_snapshot(1000.0, "TEST_ACCOUNT", [order])
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE order_snapshots
+                SET order_key = 'PERM:22|ORDER:0|CONID:265598'
+                """
+            )
+
+        self.store = TimeSeriesStore(self.db_path)
+
+        self.assertEqual(
+            self.order_segments()[0]["order_key"],
+            "PERM:22|ORDER:0",
+        )
 
     def test_earnings_results_preserve_historical_dates(self):
         self.store.upsert_earnings_result("AAPL", "2026-05-01", 1000.0)

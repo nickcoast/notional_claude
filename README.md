@@ -78,14 +78,27 @@ orders use last trade when available; option orders prefer the bid/ask midpoint.
 The orders page reconciles open-order status with same-session executions so a
 stale open-order status does not keep a filled order looking actionable. Filled
 orders are hidden by default and can be shown with the `Show filled` toggle.
-Each poll stores the displayed order rows in SQLite and de-duplicates execution
-fills by IB execution id. On startup, the service asks TWS for recent executions
+SQLite stores compact order-state segments instead of one row per poll. A
+segment's `first_seen_at` and `last_seen_at` bracket repeated observations of
+the same meaningful order state; quote-derived fields such as current price and
+`Away` update in place. Changes to order intent or status, such as stop price,
+limit price, quantity, filled amount, or remaining amount, create a new segment.
+
+Execution fills are stored separately and de-duplicated by IB execution id.
+Executions are the authoritative source for fill time, fill quantity, and
+History page attribution. On startup, the service asks TWS for recent executions
 using a read-only `reqExecutions` request so completed fills can survive app
 restarts. The default backfill window is 7 days, but IBKR only returns what TWS
 has available in its Trade Log settings; IB Gateway is typically limited to the
 current day. Older stored executions remain available for future history views,
 but the live Orders page only synthesizes filled rows for today's executions so
 `Show filled` does not turn into a multi-day trade log.
+
+When an older database is opened, the app migrates the previous row-per-poll
+`order_snapshots` table to compact segments and renames the old table to
+`order_snapshots_legacy` for rollback. That migration reduces new row growth
+immediately, but the SQLite file will not shrink until the legacy table is later
+dropped and the database is vacuumed.
 
 Portfolio and order symbols use the same earnings-date highlighting: red within
 3 days, orange within 7 days, and amber within 30 days. Tapping a highlighted
@@ -177,7 +190,7 @@ Net Liquidation values are rolled up as snapshots arrive.
 | `config.json` | Account nicknames, selected account |
 | `delta_cache.json` | Last-known option deltas (survives market close) |
 | `price_cache.json` | Last-known underlying prices (reduces cost-basis fallback) |
-| `history.sqlite3` | Account, symbol, contract, and daily high/low history |
+| `history.sqlite3` | Account, symbol, contract, order-state, execution, and daily high/low history |
 
 ## Testing
 

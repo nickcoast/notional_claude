@@ -307,7 +307,7 @@ def _serialize_snapshot(
     metrics = {}
     if account_df is not None:
         metrics = {
-            "net_liquidation":        get_account_value(account_df, "NetLiquidation",                       numeric=True, default=0.0),
+            "net_liquidation":        get_account_value(account_df, "NetLiquidation",                       numeric=True, default=None),
             "gross_position_value":   get_account_value(account_df, "GrossPositionValue",                   numeric=True, default=0.0),
             "sma":                    get_account_value(account_df, "SMA",                                  numeric=True, default=0.0),
             "portfolio_theta":        safe_float_conversion(get_account_value(account_df, "Portfolio Theta")),
@@ -967,7 +967,7 @@ class IBPollingService:
             underlying_price_cache=self._underlying_price_cache,
             account_filter=self._selected_account,
         )
-        open_orders, executions = self._fetch_open_orders()
+        open_orders, executions, orders_complete = self._fetch_open_orders()
         contract_positions = []
         if health:
             contract_positions = health.pop("contract_positions", []) or []
@@ -1035,12 +1035,13 @@ class IBPollingService:
                 account_filter=self._selected_account,
                 contract_positions=contract_positions,
             )
+            self._history_store.insert_executions(executions)
             self._history_store.insert_order_snapshot(
                 as_of=as_of,
                 account_filter=self._selected_account,
                 orders=open_orders,
+                complete=orders_complete,
             )
-            self._history_store.insert_executions(executions)
         except Exception as exc:
             logger.warning("Failed to persist time-series snapshot: %s", exc, exc_info=True)
 
@@ -1069,10 +1070,10 @@ class IBPollingService:
         except Exception as exc:
             logger.warning("Failed to backfill executions: %s", exc)
 
-    def _fetch_open_orders(self) -> tuple[list[dict], list[dict]]:
+    def _fetch_open_orders(self) -> tuple[list[dict], list[dict], bool]:
         """Fetch and normalize open IB orders without trading side effects."""
         if not self.ib.isConnected():
-            return [], []
+            return [], [], False
 
         getters = [("local open trades", self.ib.openTrades)]
         if self._open_order_scope == "all":
@@ -1080,10 +1081,12 @@ class IBPollingService:
         elif self._open_order_scope == "client":
             getters.append(("client open orders", self.ib.reqOpenOrders))
         trades = []
+        complete = True
         for label, getter in getters:
             try:
                 trades.extend(getter() or [])
             except Exception as exc:
+                complete = False
                 logger.warning("Failed to fetch %s: %s", label, exc)
 
         unique = {}
@@ -1120,6 +1123,7 @@ class IBPollingService:
                 "symbol": getattr(contract, "symbol", "") if contract else "",
                 "local_symbol": getattr(contract, "localSymbol", "") if contract else "",
                 "security_type": getattr(contract, "secType", "") if contract else "",
+                "con_id": getattr(contract, "conId", None) if contract else None,
                 "action": getattr(order, "action", ""),
                 "order_type": getattr(order, "orderType", ""),
                 "total_quantity": safe_float_conversion(getattr(order, "totalQuantity", 0)),
@@ -1136,6 +1140,7 @@ class IBPollingService:
                 "order_id": order_id,
                 "perm_id": perm_id,
                 "parent_id": int(safe_float_conversion(getattr(order, "parentId", 0))),
+                "client_id": int(safe_float_conversion(getattr(order, "clientId", 0))),
             })
 
         seen_order_keys = {
@@ -1153,7 +1158,7 @@ class IBPollingService:
 
         orders.sort(key=lambda item: (item.get("symbol") or "", item.get("order_id") or 0))
         self._annotate_order_price_distance(orders, unique.values())
-        return orders, execution_records
+        return orders, execution_records, complete
 
     def _fetch_execution_fill_totals(
         self,
@@ -1229,6 +1234,8 @@ class IBPollingService:
                     "order_id": order_id,
                     "perm_id": perm_id,
                     "parent_id": 0,
+                    "con_id": record.get("con_id"),
+                    "client_id": record.get("client_id"),
                     "_fill_notional": 0.0,
                 },
             )
@@ -1315,6 +1322,7 @@ class IBPollingService:
             key = (
                 int(safe_float_conversion(getattr(order, "permId", 0))),
                 int(safe_float_conversion(getattr(order, "orderId", 0))),
+                getattr(contract, "conId", None),
             )
             contract_by_key[key] = contract
 
@@ -1329,7 +1337,11 @@ class IBPollingService:
             order["order_price"] = order_price
             order["current_price"] = None
             order["price_distance_pct"] = None
-            contract = contract_by_key.get((order.get("perm_id"), order.get("order_id")))
+            contract = contract_by_key.get((
+                order.get("perm_id"),
+                order.get("order_id"),
+                order.get("con_id"),
+            ))
             if contract is None or not (is_valid_number(order_price) and float(order_price) > 0):
                 continue
             try:
